@@ -1,6 +1,6 @@
 /**
- * GroupChatScreen - Multi-Character Group Discussions in React Native
- * Coordinates turns safely with GroupChatOrchestrator and anti-loop guards.
+ * GroupChatScreen - multi-persona room discussions.
+ * Room messages are stored under conversation id "conv-group-<groupId>".
  */
 
 import React, { useState, useEffect, useRef } from 'react';
@@ -11,6 +11,7 @@ import {
   Pressable,
   FlatList,
   Modal,
+  ScrollView,
   StyleSheet,
   Alert,
   KeyboardAvoidingView,
@@ -26,128 +27,153 @@ import {
   saveGroup,
   saveMessage,
 } from '../../services/database/db';
-import { groupChatOrchestrator, GroupTurnEvent } from '../../services/group/GroupChatOrchestrator';
+import {
+  groupChatOrchestrator,
+  GroupTurnEvent,
+} from '../../services/group/GroupChatOrchestrator';
 import { PersonaAvatar } from '../common/PersonaAvatar';
 import { RichResponseRenderer } from '../chat/RichResponseRenderer';
 
+const roomConversationId = (groupId: string) => `conv-group-${groupId}`;
+
 export const GroupChatScreen: React.FC = () => {
   const [groups, setGroups] = useState<GroupChat[]>([]);
-  const [activeGroup, setActiveGroup] = useState<GroupChat | null>(null);
+  const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   const [characters, setCharacters] = useState<CharacterCard[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
-  const [isOrchestrating, setIsOrchestrating] = useState(false);
-  const [currentSpeaker, setCurrentSpeaker] = useState<CharacterCard | null>(null);
-  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [isBusy, setIsBusy] = useState(false);
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
-  // New Group State
-  const [newGroupName, setNewGroupName] = useState('');
-  const [selectedCharIds, setSelectedCharIds] = useState<string[]>(['char-clover', 'char-aegis']);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [newRoomName, setNewRoomName] = useState('');
+  const [selectedCharIds, setSelectedCharIds] = useState<string[]>([]);
 
   const flatListRef = useRef<FlatList>(null);
+  const activeGroupIdRef = useRef<string | null>(null);
+
+  const activeGroup = groups.find((g) => g.id === activeGroupId) ?? null;
 
   useEffect(() => {
-    loadData();
+    activeGroupIdRef.current = activeGroupId;
+  }, [activeGroupId]);
+
+  useEffect(() => {
+    loadRooms();
   }, []);
 
-  const loadData = async () => {
-    const chars = await getCharacters();
+  useEffect(() => {
+    if (!activeGroupId) {
+      setMessages([]);
+      return;
+    }
+    loadMessages(activeGroupId);
+  }, [activeGroupId]);
+
+  const loadRooms = async () => {
+    const [chars, rooms] = await Promise.all([getCharacters(), getGroups()]);
     setCharacters(chars);
-    const grps = await getGroups();
-    setGroups(grps);
-    if (grps.length > 0 && !activeGroup) {
-      setActiveGroup(grps[0]);
+    setGroups(rooms);
+    setActiveGroupId((current) => current ?? rooms[0]?.id ?? null);
+  };
+
+  /** Only applies the result if the user is still viewing that room. */
+  const loadMessages = async (groupId: string) => {
+    const msgs = await getMessages(roomConversationId(groupId));
+    if (activeGroupIdRef.current === groupId) {
+      setMessages(msgs);
     }
   };
 
-  useEffect(() => {
-    if (activeGroup) {
-      loadGroupMessages(activeGroup.id);
+  const handleTurnEvent = (event: GroupTurnEvent) => {
+    if (event.status === 'thinking') {
+      setSpeakingId(event.character.id);
+      return;
     }
-  }, [activeGroup?.id]);
+    setSpeakingId(null);
+    if (event.status === 'error') {
+      setNotice(`${event.character.name} could not respond: ${event.error ?? 'unknown error'}`);
+    } else if (event.status === 'interrupted') {
+      setNotice(`${event.character.name} was stopped.`);
+    }
+  };
 
-  const loadGroupMessages = async (groupId: string) => {
-    const convId = `conv-group-${groupId}`;
-    const msgs = await getMessages(convId);
-    setMessages(msgs);
+  const runTurn = async (group: GroupChat, forcedCharId?: string) => {
+    if (isBusy) return;
+    setIsBusy(true);
+    setNotice(null);
+    try {
+      await groupChatOrchestrator.executeGroupTurn(
+        roomConversationId(group.id),
+        group,
+        handleTurnEvent,
+        forcedCharId
+      );
+      await loadMessages(group.id);
+    } finally {
+      setIsBusy(false);
+      setSpeakingId(null);
+    }
   };
 
   const handleSend = async () => {
     const text = inputText.trim();
-    if (!text || !activeGroup || isOrchestrating) return;
+    if (!text || !activeGroup || isBusy) return;
 
     setInputText('');
-    const convId = `conv-group-${activeGroup.id}`;
-
     const userMsg: Message = {
       id: `msg-grp-${Date.now()}-u`,
-      conversationId: convId,
+      conversationId: roomConversationId(activeGroup.id),
       senderType: 'user',
       senderName: 'You',
       content: text,
-      createdAt: Date.now(),
       status: 'complete',
+      createdAt: Date.now(),
     };
 
     await saveMessage(userMsg);
     setMessages((prev) => [...prev, userMsg]);
     groupChatOrchestrator.resetLoopGuard();
-
-    triggerNextTurn(convId);
-  };
-
-  const triggerNextTurn = async (convId: string, forcedCharId?: string) => {
-    if (!activeGroup || isOrchestrating) return;
-
-    setIsOrchestrating(true);
-    try {
-      await groupChatOrchestrator.executeGroupTurn(
-        convId,
-        activeGroup,
-        (event: GroupTurnEvent) => {
-          if (event.status === 'thinking') {
-            setCurrentSpeaker(event.character);
-          } else if (event.status === 'completed' && event.message) {
-            setMessages((prev) => [...prev, event.message!]);
-            setCurrentSpeaker(null);
-          } else {
-            setCurrentSpeaker(null);
-          }
-        },
-        forcedCharId
-      );
-    } finally {
-      setIsOrchestrating(false);
-      setCurrentSpeaker(null);
-    }
+    await runTurn(activeGroup);
   };
 
   const handleStop = () => {
     groupChatOrchestrator.stopOrchestration();
-    setIsOrchestrating(false);
-    setCurrentSpeaker(null);
+  };
+
+  const openCreateModal = () => {
+    setSelectedCharIds(characters.slice(0, 2).map((c) => c.id));
+    setShowCreateModal(true);
+  };
+
+  const togglePicked = (id: string) => {
+    setSelectedCharIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
   };
 
   const handleCreateGroup = async () => {
-    if (!newGroupName.trim() || selectedCharIds.length < 2) {
-      Alert.alert('Incomplete', 'Enter a name and select at least 2 participants.');
+    const name = newRoomName.trim();
+    if (!name || selectedCharIds.length < 2) {
+      Alert.alert('Incomplete', 'Enter a name and select at least 2 personas.');
       return;
     }
 
-    const grp: GroupChat = {
+    const room: GroupChat = {
       id: `grp-${Date.now()}`,
-      name: newGroupName.trim(),
+      name,
       description: `Discussion with ${selectedCharIds.length} personas`,
       characterIds: selectedCharIds,
       turnMode: 'auto-moderated',
       createdAt: Date.now(),
     };
 
-    await saveGroup(grp);
-    await loadData();
-    setActiveGroup(grp);
+    await saveGroup(room);
+    await loadRooms();
+    setActiveGroupId(room.id);
     setShowCreateModal(false);
-    setNewGroupName('');
+    setNewRoomName('');
   };
 
   return (
@@ -160,35 +186,64 @@ export const GroupChatScreen: React.FC = () => {
         <View style={styles.headerLeft}>
           <Users size={20} color={theme.colors.emeraldText} />
           <View>
-            <Text style={styles.headerTitle}>
-              {activeGroup ? activeGroup.name : 'Group Discussions'}
-            </Text>
+            <Text style={styles.headerTitle}>{activeGroup ? activeGroup.name : 'Group Rooms'}</Text>
             <Text style={styles.headerSubtitle}>
-              {activeGroup ? `${activeGroup.characterIds.length} Personas` : 'Select or create a room'}
+              {activeGroup
+                ? `${activeGroup.characterIds.length} personas`
+                : 'Create a room to begin'}
             </Text>
           </View>
         </View>
 
-        <Pressable style={styles.createBtn} onPress={() => setShowCreateModal(true)}>
+        <Pressable style={styles.createBtn} onPress={openCreateModal}>
           <Plus size={14} color="#ffffff" />
           <Text style={styles.createBtnText}>New Room</Text>
         </Pressable>
       </View>
 
-      {/* Participants Avatar Bar */}
+      {/* Room selector */}
+      {groups.length > 0 && (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.roomBar}
+          contentContainerStyle={styles.roomBarContent}
+        >
+          {groups.map((g) => {
+            const selected = g.id === activeGroupId;
+            return (
+              <Pressable
+                key={g.id}
+                style={[styles.roomChip, selected && styles.roomChipActive]}
+                onPress={() => setActiveGroupId(g.id)}
+              >
+                <Text style={[styles.roomChipText, selected && styles.roomChipTextActive]}>
+                  {g.name}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      )}
+
+      {/* Participants: tap a persona to make them speak next */}
       {activeGroup && (
         <View style={styles.participantsBar}>
-          <Text style={styles.participantsLabel}>Turn:</Text>
+          <Text style={styles.participantsLabel}>Speak:</Text>
           {activeGroup.characterIds.map((cId) => {
             const char = characters.find((c) => c.id === cId);
             if (!char) return null;
-            const isSpeaking = currentSpeaker?.id === char.id;
-
+            const isSpeaking = speakingId === char.id;
             return (
               <Pressable
                 key={char.id}
-                style={[styles.charChip, isSpeaking && styles.charChipSpeaking]}
-                onPress={() => triggerNextTurn(`conv-group-${activeGroup.id}`, char.id)}
+                disabled={isBusy}
+                style={[
+                  styles.charChip,
+                  isSpeaking && styles.charChipSpeaking,
+                  isBusy && styles.charChipDisabled,
+                ]}
+                onPress={() => runTurn(activeGroup, char.id)}
               >
                 <PersonaAvatar name={char.name} avatarKey={char.avatarKey} size={22} />
                 <Text style={styles.charChipName}>{char.name}</Text>
@@ -196,12 +251,18 @@ export const GroupChatScreen: React.FC = () => {
               </Pressable>
             );
           })}
-          {isOrchestrating && (
+          {isBusy && (
             <Pressable style={styles.stopBtn} onPress={handleStop}>
               <Square size={12} color="#ffffff" fill="#ffffff" />
             </Pressable>
           )}
         </View>
+      )}
+
+      {notice && (
+        <Pressable style={styles.noticeBox} onPress={() => setNotice(null)}>
+          <Text style={styles.noticeText}>{notice}</Text>
+        </Pressable>
       )}
 
       {/* Messages */}
@@ -219,7 +280,12 @@ export const GroupChatScreen: React.FC = () => {
                 <PersonaAvatar name={item.senderName} avatarKey={item.senderAvatar} size={28} />
               )}
               <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
-                {!isUser && <Text style={styles.senderLabel}>{item.senderName}</Text>}
+                {!isUser && (
+                  <Text style={styles.senderLabel}>
+                    {item.senderName}
+                    {item.status === 'interrupted' ? '  [interrupted]' : ''}
+                  </Text>
+                )}
                 {isUser ? (
                   <Text style={styles.userContent}>{item.content}</Text>
                 ) : (
@@ -232,10 +298,10 @@ export const GroupChatScreen: React.FC = () => {
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyTitle}>
-              {activeGroup ? 'No messages yet' : 'Create or select a room to begin'}
+              {activeGroup ? 'No messages yet' : 'No room selected'}
             </Text>
             <Text style={styles.emptySubtitle}>
-              Participants will respond according to their system prompts and personalities.
+              Send a message, or tap a persona above to make them speak.
             </Text>
           </View>
         }
@@ -248,12 +314,13 @@ export const GroupChatScreen: React.FC = () => {
             style={styles.input}
             value={inputText}
             onChangeText={setInputText}
-            placeholder="Address the room or mention a persona..."
+            placeholder="Address the room..."
             placeholderTextColor="#64748b"
+            editable={!isBusy}
           />
           <Pressable
-            style={[styles.sendBtn, !inputText.trim() && styles.sendBtnDisabled]}
-            disabled={!inputText.trim() || isOrchestrating}
+            style={[styles.sendBtn, (!inputText.trim() || isBusy) && styles.sendBtnDisabled]}
+            disabled={!inputText.trim() || isBusy}
             onPress={handleSend}
           >
             <Send size={16} color="#ffffff" />
@@ -261,62 +328,59 @@ export const GroupChatScreen: React.FC = () => {
         </View>
       )}
 
-      {/* Create Room Modal */}
-      {showCreateModal && (
-        <Modal visible transparent animationType="slide" onRequestClose={() => setShowCreateModal(false)}>
-          <View style={styles.modalBackdrop}>
-            <View style={styles.modalCard}>
-              <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Create Discussion Room</Text>
-                <Pressable onPress={() => setShowCreateModal(false)}>
-                  <X size={20} color="#94a3b8" />
-                </Pressable>
-              </View>
+      {/* Create room */}
+      <Modal
+        visible={showCreateModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowCreateModal(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Create Discussion Room</Text>
+              <Pressable onPress={() => setShowCreateModal(false)}>
+                <X size={20} color="#94a3b8" />
+              </Pressable>
+            </View>
 
-              <Text style={styles.label}>Room Name</Text>
-              <TextInput
-                style={styles.modalInput}
-                value={newGroupName}
-                onChangeText={setNewGroupName}
-                placeholder="e.g. Systems Architecture Roundtable"
-                placeholderTextColor="#64748b"
-              />
+            <Text style={styles.label}>Room name</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={newRoomName}
+              onChangeText={setNewRoomName}
+              placeholder="e.g. Systems Architecture Roundtable"
+              placeholderTextColor="#64748b"
+            />
 
-              <Text style={styles.label}>Select Participants (min 2)</Text>
-              <View style={styles.charPicker}>
-                {characters.map((c) => {
-                  const selected = selectedCharIds.includes(c.id);
-                  return (
-                    <Pressable
-                      key={c.id}
-                      style={[styles.pickerItem, selected && styles.pickerItemSelected]}
-                      onPress={() => {
-                        if (selected) {
-                          setSelectedCharIds(selectedCharIds.filter((id) => id !== c.id));
-                        } else {
-                          setSelectedCharIds([...selectedCharIds, c.id]);
-                        }
-                      }}
-                    >
-                      <PersonaAvatar name={c.name} avatarKey={c.avatarKey} size={28} />
-                      <Text style={styles.pickerText}>{c.name}</Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
+            <Text style={styles.label}>Personas (choose at least 2)</Text>
+            <View style={styles.charPicker}>
+              {characters.map((c) => {
+                const selected = selectedCharIds.includes(c.id);
+                return (
+                  <Pressable
+                    key={c.id}
+                    style={[styles.pickerItem, selected && styles.pickerItemSelected]}
+                    onPress={() => togglePicked(c.id)}
+                  >
+                    <PersonaAvatar name={c.name} avatarKey={c.avatarKey} size={28} />
+                    <Text style={styles.pickerText}>{c.name}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
 
-              <View style={styles.modalActions}>
-                <Pressable style={styles.cancelBtn} onPress={() => setShowCreateModal(false)}>
-                  <Text style={styles.cancelBtnText}>Cancel</Text>
-                </Pressable>
-                <Pressable style={styles.confirmBtn} onPress={handleCreateGroup}>
-                  <Text style={styles.confirmBtnText}>Create</Text>
-                </Pressable>
-              </View>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.cancelBtn} onPress={() => setShowCreateModal(false)}>
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </Pressable>
+              <Pressable style={styles.confirmBtn} onPress={handleCreateGroup}>
+                <Text style={styles.confirmBtnText}>Create</Text>
+              </Pressable>
             </View>
           </View>
-        </Modal>
-      )}
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 };
@@ -340,6 +404,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
+    flex: 1,
   },
   headerTitle: {
     fontSize: 15,
@@ -364,9 +429,41 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#ffffff',
   },
+  roomBar: {
+    maxHeight: 44,
+    backgroundColor: theme.colors.bgSurface,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+  },
+  roomBarContent: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 6,
+  },
+  roomChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: theme.colors.bgCard,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  roomChipActive: {
+    backgroundColor: theme.colors.emeraldDark,
+    borderColor: theme.colors.emerald,
+  },
+  roomChipText: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    fontWeight: '600',
+  },
+  roomChipTextActive: {
+    color: '#ffffff',
+  },
   participantsBar: {
     flexDirection: 'row',
     alignItems: 'center',
+    flexWrap: 'wrap',
     paddingHorizontal: 12,
     paddingVertical: 8,
     backgroundColor: '#0a101f',
@@ -394,6 +491,9 @@ const styles = StyleSheet.create({
     borderColor: theme.colors.emerald,
     backgroundColor: 'rgba(16, 185, 129, 0.12)',
   },
+  charChipDisabled: {
+    opacity: 0.5,
+  },
   charChipName: {
     fontSize: 11.5,
     color: theme.colors.textPrimary,
@@ -410,6 +510,17 @@ const styles = StyleSheet.create({
     padding: 6,
     borderRadius: 6,
     marginLeft: 'auto',
+  },
+  noticeBox: {
+    backgroundColor: 'rgba(245, 158, 11, 0.12)',
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  noticeText: {
+    fontSize: 12,
+    color: theme.colors.amber,
   },
   list: {
     padding: 16,
