@@ -1,10 +1,17 @@
 /**
  * RuntimeConnectionManager
- * Manages loopback connectivity, auto-bootstrapping Termux services, health monitoring,
- * and engine failover.
+ * State machine managing loopback connectivity to local llama.cpp / Prism ML servers in Termux.
+ * Never reports fake success. Checks AppState to avoid background polling.
  */
 
-import { termuxIntegration } from '../../../modules/termux-integration';
+import { AppState, AppStateStatus } from 'react-native';
+import {
+  dispatchTermuxScript,
+  hasRunCommandPermission,
+  isTermuxInstalled,
+  probeTcp,
+  termuxAvailability,
+} from '../../../modules/termux-integration';
 import {
   EngineStatus,
   EngineType,
@@ -16,18 +23,17 @@ import { InferenceEngine } from '../engines/contracts/InferenceEngine';
 import { LlamaCppAdapter } from '../engines/llamaCpp/LlamaCppAdapter';
 import { PrismMLAdapter } from '../engines/prismML/PrismMLAdapter';
 
-export type ConnectionEvent =
+export type ConnectionState =
   | 'idle'
-  | 'checking_server'
-  | 'starting_termux'
-  | 'waiting_readiness'
+  | 'checking'
+  | 'starting'
+  | 'waiting'
   | 'connected'
-  | 'server_unavailable'
-  | 'reconnecting';
+  | 'failed';
 
 export interface RuntimeListener {
-  onStatusChange?: (status: EngineStatus, event: ConnectionEvent, details?: string) => void;
-  onModelsDiscovered?: (models: ModelInfo[]) => void;
+  onStateChange?: (state: ConnectionState, message: string) => void;
+  onDiagnosticsUpdate?: (diag: RuntimeDiagnostics) => void;
 }
 
 export class RuntimeConnectionManager {
@@ -36,27 +42,30 @@ export class RuntimeConnectionManager {
   private llamaAdapter: LlamaCppAdapter;
   private prismAdapter: PrismMLAdapter;
   private activeEngineType: EngineType = 'llama.cpp';
-  private connectionEvent: ConnectionEvent = 'idle';
-  private isAutoConnecting = false;
+  private currentState: ConnectionState = 'idle';
+  private stateMessage = 'Ready';
   private listeners: Set<RuntimeListener> = new Set();
-  private healthCheckTimer: any = null;
-  private retryCount = 0;
-  private maxRetries = 5;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private isConnecting = false;
+  private appState: AppStateStatus = 'active';
 
   private diagnostics: RuntimeDiagnostics = {
-    termuxAppInstalled: true,
-    termuxRunCommandPermission: true,
+    termuxAppInstalled: false,
+    termuxRunCommandPermission: false,
     llamaStatus: 'disconnected',
     llamaLatencyMs: null,
+    embeddingServerStatus: 'disconnected',
+    embeddingLatencyMs: null,
     prismStatus: 'disconnected',
     prismLatencyMs: null,
     activePort: 8080,
-    lastCheckedAt: Date.now(),
+    lastCheckedAt: 0,
   };
 
   private constructor() {
     this.config = {
       llamaBaseUrl: 'http://127.0.0.1:8080',
+      embeddingBaseUrl: 'http://127.0.0.1:8081',
       prismBaseUrl: 'http://127.0.0.1:8000',
       selectedEngine: 'llama.cpp',
       autoConnectOnLaunch: true,
@@ -69,6 +78,16 @@ export class RuntimeConnectionManager {
     this.llamaAdapter = new LlamaCppAdapter(this.config.llamaBaseUrl);
     this.prismAdapter = new PrismMLAdapter({ baseUrl: this.config.prismBaseUrl });
     this.activeEngineType = this.config.selectedEngine;
+
+    // Track app foreground/background
+    AppState.addEventListener('change', (next) => {
+      this.appState = next;
+      if (next === 'active') {
+        this.startWatchdog();
+      } else {
+        this.stopWatchdog();
+      }
+    });
   }
 
   public static getInstance(): RuntimeConnectionManager {
@@ -82,20 +101,20 @@ export class RuntimeConnectionManager {
     return this.activeEngineType === 'llama.cpp' ? this.llamaAdapter : this.prismAdapter;
   }
 
-  public getEngine(type: EngineType): InferenceEngine {
-    return type === 'llama.cpp' ? this.llamaAdapter : this.prismAdapter;
-  }
-
   public getActiveEngineType(): EngineType {
     return this.activeEngineType;
   }
 
-  public getDiagnostics(): RuntimeDiagnostics {
-    return { ...this.diagnostics };
+  public getCurrentState(): ConnectionState {
+    return this.currentState;
   }
 
-  public getConnectionEvent(): ConnectionEvent {
-    return this.connectionEvent;
+  public getStateMessage(): string {
+    return this.stateMessage;
+  }
+
+  public getDiagnostics(): RuntimeDiagnostics {
+    return { ...this.diagnostics };
   }
 
   public subscribe(listener: RuntimeListener): () => void {
@@ -103,23 +122,51 @@ export class RuntimeConnectionManager {
     return () => this.listeners.delete(listener);
   }
 
-  private notify(status: EngineStatus, event: ConnectionEvent, details?: string) {
-    this.connectionEvent = event;
+  private transitionTo(state: ConnectionState, message: string) {
+    this.currentState = state;
+    this.stateMessage = message;
     for (const l of this.listeners) {
-      l.onStatusChange?.(status, event, details);
+      l.onStateChange?.(state, message);
     }
   }
 
   /**
-   * Primary workflow:
-   * 1. Probe loopback port.
-   * 2. If running, connect and discover models immediately.
-   * 3. If offline, dispatch Termux RUN_COMMAND intent.
-   * 4. Poll with bounded exponential backoff until server is ready.
+   * Probes port via raw TCP and verifies HTTP GET /health returns 200 with ok status.
+   */
+  public async verifyServerHealth(port: number): Promise<{ healthy: boolean; latencyMs: number | null; error?: string }> {
+    const tcp = await probeTcp('127.0.0.1', port, 1200);
+    if (!tcp.isOpen) {
+      return { healthy: false, latencyMs: null, error: tcp.error || 'Port closed' };
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      const res = await fetch(`http://127.0.0.1:${port}/health`, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (res.ok) {
+        const body = await res.json().catch(() => null);
+        if (body && (body.status === 'ok' || body.status === 'loading model')) {
+          return { healthy: true, latencyMs: tcp.latencyMs };
+        }
+      }
+      return { healthy: false, latencyMs: tcp.latencyMs, error: `HTTP ${res.status}` };
+    } catch (err: any) {
+      return { healthy: false, latencyMs: tcp.latencyMs, error: err.message || 'Health probe failed' };
+    }
+  }
+
+  /**
+   * Main connection sequence
    */
   public async initializeConnection(targetEngine?: EngineType): Promise<boolean> {
-    if (this.isAutoConnecting) return false;
-    this.isAutoConnecting = true;
+    if (this.isConnecting) return false;
+    this.isConnecting = true;
 
     if (targetEngine) {
       this.activeEngineType = targetEngine;
@@ -128,62 +175,91 @@ export class RuntimeConnectionManager {
     const currentPort = this.activeEngineType === 'llama.cpp' ? 8080 : 8000;
     this.diagnostics.activePort = currentPort;
 
-    this.notify('connecting', 'checking_server', `Checking loopback :${currentPort}...`);
-
-    try {
-      // 1. Probe current port
-      const probe = await termuxIntegration.probeSocket('127.0.0.1', currentPort, 1200);
-      if (probe.isOpen) {
-        return await this.finalizeConnection('Already running in background');
-      }
-
-      // 2. Server not running -> Attempt automatic start via Termux RUN_COMMAND
-      this.notify(
-        'connecting',
-        'starting_termux',
-        `Starting Termux ${this.activeEngineType} service via RUN_COMMAND...`
-      );
-
-      const startResult = await termuxIntegration.startTermuxService(
-        this.config.runCommandPath,
-        this.activeEngineType,
-        currentPort
-      );
-
-      // 3. Wait for readiness with exponential backoff
-      this.notify(
-        'connecting',
-        'waiting_readiness',
-        `Awaiting server readiness on port ${currentPort}...`
-      );
-
-      const isReady = await this.pollUntilReady(currentPort, 10, 800);
-      if (isReady) {
-        return await this.finalizeConnection('Termux background server bootstrapped successfully');
-      } else {
-        this.notify(
-          'disconnected',
-          'server_unavailable',
-          `Server offline on port ${currentPort}. Is Termux running with start_ai_service.sh?`
-        );
-        this.diagnostics.errorDetails = `Connection refused on 127.0.0.1:${currentPort}.`;
-        this.startBackgroundWatchdog();
-        return false;
-      }
-    } catch (err: any) {
-      this.notify('error', 'server_unavailable', err.message || 'Connection failure');
+    // 1. Check native Termux module availability
+    const avail = termuxAvailability();
+    if (!avail.available) {
+      this.transitionTo('failed', 'Native Termux integration module is not available on this build.');
+      this.isConnecting = false;
       return false;
-    } finally {
-      this.isAutoConnecting = false;
     }
+
+    this.transitionTo('checking', `Probing 127.0.0.1:${currentPort}...`);
+
+    // Probe current port
+    const initialHealth = await this.verifyServerHealth(currentPort);
+    if (initialHealth.healthy) {
+      this.diagnostics.llamaStatus = 'connected';
+      this.diagnostics.llamaLatencyMs = initialHealth.latencyMs;
+      this.transitionTo('connected', `Connected to local server on port ${currentPort}`);
+      this.isConnecting = false;
+      this.startWatchdog();
+      return true;
+    }
+
+    // Server is not running -> check prerequisites for start
+    const installed = await isTermuxInstalled();
+    this.diagnostics.termuxAppInstalled = installed;
+    if (!installed) {
+      this.transitionTo('failed', 'Termux app (com.termux) is not installed on this device.');
+      this.isConnecting = false;
+      return false;
+    }
+
+    const perm = await hasRunCommandPermission();
+    this.diagnostics.termuxRunCommandPermission = perm;
+    if (!perm) {
+      this.transitionTo(
+        'failed',
+        'Permission com.termux.permission.RUN_COMMAND is not granted. Enable in Android App Settings.'
+      );
+      this.isConnecting = false;
+      return false;
+    }
+
+    // 2. Dispatch Termux script
+    this.transitionTo('starting', `Sending RUN_COMMAND to Termux for ${this.activeEngineType}...`);
+    const dispatch = await dispatchTermuxScript(
+      this.config.runCommandPath,
+      this.activeEngineType,
+      currentPort
+    );
+
+    if (!dispatch.success) {
+      this.transitionTo('failed', `Failed to dispatch intent: ${dispatch.message}`);
+      this.isConnecting = false;
+      return false;
+    }
+
+    // 3. Waiting for readiness with capped exponential backoff (up to 25s)
+    this.transitionTo('waiting', `Awaiting server readiness on port ${currentPort}...`);
+    const ready = await this.pollReadiness(currentPort, 25000);
+
+    if (ready) {
+      this.diagnostics.llamaStatus = 'connected';
+      this.transitionTo('connected', `Connected to local server on port ${currentPort}`);
+      this.startWatchdog();
+      this.isConnecting = false;
+      return true;
+    }
+
+    // Timeout failure with diagnostic checklist
+    this.transitionTo(
+      'failed',
+      `Timeout waiting for port ${currentPort}. Checklist: 1) allow-external-apps=true in ~/.termux/termux.properties; 2) start_ai_service.sh exists & executable; 3) GGUF model in ~/models/`
+    );
+    this.diagnostics.llamaStatus = 'disconnected';
+    this.isConnecting = false;
+    return false;
   }
 
-  private async pollUntilReady(port: number, maxAttempts = 8, initialDelayMs = 800): Promise<boolean> {
-    let delay = initialDelayMs;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  private async pollReadiness(port: number, maxWaitMs: number): Promise<boolean> {
+    const start = Date.now();
+    let delay = 800;
+
+    while (Date.now() - start < maxWaitMs) {
       await new Promise((r) => setTimeout(r, delay));
-      const probe = await termuxIntegration.probeSocket('127.0.0.1', port, 1000);
-      if (probe.isOpen) {
+      const health = await this.verifyServerHealth(port);
+      if (health.healthy) {
         return true;
       }
       delay = Math.min(delay * 1.35, 2500);
@@ -191,78 +267,53 @@ export class RuntimeConnectionManager {
     return false;
   }
 
-  private async finalizeConnection(reason: string): Promise<boolean> {
-    const engine = this.getActiveEngine();
-    const ok = await engine.connect();
-    if (ok) {
-      this.notify('connected', 'connected', reason);
-      this.retryCount = 0;
-      this.updateDiagnosticsAfterCheck();
+  public async probeAllDiagnostics(): Promise<RuntimeDiagnostics> {
+    const installed = await isTermuxInstalled();
+    const perm = await hasRunCommandPermission();
+    const llama = await this.verifyServerHealth(8080);
+    const embed = await this.verifyServerHealth(8081);
+    const prism = await this.verifyServerHealth(8000);
 
-      // Discover models
-      try {
-        const models = await engine.getModels();
-        for (const l of this.listeners) {
-          l.onModelsDiscovered?.(models);
-        }
-      } catch {
-        // Models discovery non-fatal
-      }
+    this.diagnostics = {
+      termuxAppInstalled: installed,
+      termuxRunCommandPermission: perm,
+      llamaStatus: llama.healthy ? 'connected' : 'disconnected',
+      llamaLatencyMs: llama.latencyMs,
+      embeddingServerStatus: embed.healthy ? 'connected' : 'disconnected',
+      embeddingLatencyMs: embed.latencyMs,
+      prismStatus: prism.healthy ? 'connected' : 'disconnected',
+      prismLatencyMs: prism.latencyMs,
+      activePort: this.activeEngineType === 'llama.cpp' ? 8080 : 8000,
+      lastCheckedAt: Date.now(),
+    };
 
-      this.startBackgroundWatchdog();
-      return true;
-    } else {
-      this.notify('disconnected', 'server_unavailable', 'Port open but HTTP health failed');
-      return false;
-    }
-  }
-
-  public async switchEngine(engineType: EngineType): Promise<boolean> {
-    if (this.activeEngineType === engineType && (await this.getActiveEngine().getStatus()) === 'connected') {
-      return true;
+    for (const l of this.listeners) {
+      l.onDiagnosticsUpdate?.(this.diagnostics);
     }
 
-    await this.getActiveEngine().disconnect();
-    this.activeEngineType = engineType;
-    return await this.initializeConnection(engineType);
-  }
-
-  public async probeAllEngines(): Promise<RuntimeDiagnostics> {
-    const llamaProbe = await termuxIntegration.probeSocket('127.0.0.1', 8080, 1000);
-    const prismProbe = await termuxIntegration.probeSocket('127.0.0.1', 8000, 1000);
-
-    this.diagnostics.llamaStatus = llamaProbe.isOpen ? 'connected' : 'disconnected';
-    this.diagnostics.llamaLatencyMs = llamaProbe.latencyMs;
-
-    this.diagnostics.prismStatus = prismProbe.isOpen ? 'connected' : 'disconnected';
-    this.diagnostics.prismLatencyMs = prismProbe.latencyMs;
-
-    this.diagnostics.lastCheckedAt = Date.now();
     return { ...this.diagnostics };
   }
 
-  private updateDiagnosticsAfterCheck() {
-    this.probeAllEngines().catch(() => {});
-  }
+  private startWatchdog() {
+    this.stopWatchdog();
+    if (this.appState !== 'active') return;
 
-  private startBackgroundWatchdog() {
-    if (this.healthCheckTimer) clearInterval(this.healthCheckTimer);
-
-    this.healthCheckTimer = setInterval(async () => {
-      const engine = this.getActiveEngine();
-      const status = await engine.getStatus();
-      if (status !== 'connected' && this.retryCount < this.maxRetries) {
-        this.retryCount++;
-        this.notify('connecting', 'reconnecting', `Watchdog re-evaluating loopback connection (Attempt ${this.retryCount}/${this.maxRetries})`);
-        await this.initializeConnection();
+    this.watchdogTimer = setInterval(async () => {
+      if (this.appState !== 'active') return;
+      const port = this.activeEngineType === 'llama.cpp' ? 8080 : 8000;
+      const check = await this.verifyServerHealth(port);
+      if (check.healthy && this.currentState !== 'connected') {
+        this.transitionTo('connected', `Connected to port ${port}`);
+      } else if (!check.healthy && this.currentState === 'connected') {
+        this.transitionTo('failed', `Lost connection to port ${port}`);
       }
     }, this.config.healthCheckIntervalMs);
   }
 
-  public stopWatchdog() {
-    if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer);
-      this.healthCheckTimer = null;
+  private stopWatchdog() {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
     }
   }
 }

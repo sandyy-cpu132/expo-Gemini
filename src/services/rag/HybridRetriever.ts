@@ -1,11 +1,12 @@
 /**
  * HybridRetriever
- * Combines dense cosine similarity with BM25 lexical keyword scoring and collection filtering.
- * Uses Reciprocal Rank Fusion (RRF) to merge score distributions.
+ * Combines dense cosine similarity with BM25 lexical keyword scoring.
+ * Enforces matching embedding_model and embedding_dim to prevent silent dimension mismatch errors.
+ * Merges scores using Reciprocal Rank Fusion (RRF).
  */
 
-import { db } from '../database/SQLiteDatabase';
-import { embeddingService } from './LocalEmbeddingService';
+import { getAllChunks } from '../database/db';
+import { embeddingService, EmbeddingResult } from './LocalEmbeddingService';
 
 export interface RetrievalResult {
   chunkId: string;
@@ -19,50 +20,84 @@ export interface RetrievalResult {
   combinedScore: number;
 }
 
+export interface RetrievalResponse {
+  results: RetrievalResult[];
+  status: 'ok' | 'no-matching-model' | 'empty-knowledge-base' | 'embedding-offline';
+  message?: string;
+}
+
 export interface RetrievalOptions {
   topK?: number;
   minRelevanceScore?: number;
   collectionIds?: string[];
-  denseWeight?: number; // 0.0 to 1.0
+  allowKeywordFallback?: boolean;
 }
 
 export class HybridRetriever {
   private k1 = 1.2;
   private b = 0.75;
 
-  /**
-   * Performs hybrid dense + sparse BM25 retrieval over indexed document chunks.
-   */
-  public async retrieve(query: string, options?: RetrievalOptions): Promise<RetrievalResult[]> {
+  public async retrieve(query: string, options?: RetrievalOptions): Promise<RetrievalResponse> {
     const topK = options?.topK ?? 4;
     const minScore = options?.minRelevanceScore ?? 0.15;
-    const denseWeight = options?.denseWeight ?? 0.6;
-    const sparseWeight = 1.0 - denseWeight;
 
-    const allRecords = db.getAllChunks(options?.collectionIds);
-    if (allRecords.length === 0) return [];
+    const allRecords = await getAllChunks(options?.collectionIds);
+    if (allRecords.length === 0) {
+      return { results: [], status: 'empty-knowledge-base', message: 'No documents indexed in this collection.' };
+    }
 
-    // 1. Generate query embedding
-    const queryVector = await embeddingService.getEmbedding(query);
+    // 1. Obtain query embedding
+    let queryEmbedding: EmbeddingResult;
+    try {
+      queryEmbedding = await embeddingService.getEmbedding(query, {
+        allowKeywordFallback: options?.allowKeywordFallback,
+      });
+    } catch (err: any) {
+      return {
+        results: [],
+        status: 'embedding-offline',
+        message: err.message || 'Embedding server offline on 127.0.0.1:8081',
+      };
+    }
 
-    // 2. Precompute BM25 statistics
+    // 2. Filter candidates matching model and dimensions
+    const validCandidates = allRecords.filter((r) => {
+      const chunkModel = r.chunk.embedding_model || 'nomic-embed-text-v1.5';
+      const chunkDim = r.chunk.embedding_dim || 384;
+      return (
+        chunkModel === queryEmbedding.model &&
+        chunkDim === queryEmbedding.dim &&
+        r.chunk.embedding &&
+        r.chunk.embedding.length === queryEmbedding.dim
+      );
+    });
+
+    if (validCandidates.length === 0) {
+      return {
+        results: [],
+        status: 'no-matching-model',
+        message: `Indexed chunks use a different embedding model than the current query model (${queryEmbedding.model}). Please re-index.`,
+      };
+    }
+
+    // 3. Precompute BM25
     const queryTokens = query
       .toLowerCase()
       .replace(/[^a-z0-9\s]/g, ' ')
       .split(/\s+/)
       .filter((t) => t.length > 2);
 
-    const totalDocs = allRecords.length;
+    const totalDocs = validCandidates.length;
     let totalLength = 0;
     const docTokenFreqs: Map<string, number>[] = [];
     const docLengths: number[] = [];
-
-    // Doc frequency per term
     const docFreq: Map<string, number> = new Map();
 
     for (let i = 0; i < totalDocs; i++) {
-      const text = allRecords[i].chunk.content.toLowerCase();
-      const tokens = text.split(/\s+/).filter((t) => t.length > 2);
+      const tokens = validCandidates[i].chunk.content
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((t) => t.length > 2);
       docLengths.push(tokens.length);
       totalLength += tokens.length;
 
@@ -79,64 +114,78 @@ export class HybridRetriever {
 
     const avgDocLength = totalLength / (totalDocs || 1);
 
-    // 3. Score all chunks
-    const results: RetrievalResult[] = [];
+    // 4. Compute Dense & Sparse Scores
+    const scoredChunks: Array<{ record: (typeof validCandidates)[0]; denseScore: number; bm25Score: number }> = [];
 
     for (let i = 0; i < totalDocs; i++) {
-      const record = allRecords[i];
-      const chunk = record.chunk;
+      const record = validCandidates[i];
+      const dense = embeddingService.cosineSimilarity(queryEmbedding.vector, record.chunk.embedding!);
 
-      // Dense score
-      let denseScore = 0;
-      if (chunk.embedding && Array.isArray(chunk.embedding)) {
-        denseScore = embeddingService.cosineSimilarity(queryVector, chunk.embedding);
-      } else {
-        // Compute on the fly if not cached
-        const chunkVector = await embeddingService.getEmbedding(chunk.content);
-        chunk.embedding = chunkVector;
-        denseScore = embeddingService.cosineSimilarity(queryVector, chunkVector);
-      }
-      denseScore = Math.max(0, denseScore);
-
-      // BM25 score
-      let bm25Score = 0;
+      // BM25
+      let bm25 = 0;
       const tf = docTokenFreqs[i];
       const len = docLengths[i];
 
       for (const term of queryTokens) {
-        const termFreq = tf.get(term) || 0;
-        if (termFreq > 0) {
+        const count = tf.get(term) || 0;
+        if (count > 0) {
           const df = docFreq.get(term) || 0;
-          // Standard BM25 IDF
           const idf = Math.log(1 + (totalDocs - df + 0.5) / (df + 0.5));
-          const num = termFreq * (this.k1 + 1);
-          const denom = termFreq + this.k1 * (1 - this.b + this.b * (len / avgDocLength));
-          bm25Score += idf * (num / denom);
+          const num = count * (this.k1 + 1);
+          const denom = count + this.k1 * (1 - this.b + this.b * (len / avgDocLength));
+          bm25 += idf * (num / denom);
         }
       }
 
-      // Normalize BM25 approximately
-      const normalizedBm25 = Math.min(1.0, bm25Score / (queryTokens.length * 2.5 || 1));
-      const combinedScore = denseWeight * denseScore + sparseWeight * normalizedBm25;
-
-      if (combinedScore >= minScore) {
-        results.push({
-          chunkId: chunk.id,
-          documentId: chunk.documentId,
-          documentName: record.docName,
-          content: chunk.content,
-          sectionHeader: chunk.sectionHeader,
-          pageNumber: chunk.pageNumber,
-          denseScore: Math.round(denseScore * 1000) / 1000,
-          bm25Score: Math.round(normalizedBm25 * 1000) / 1000,
-          combinedScore: Math.round(combinedScore * 1000) / 1000,
-        });
-      }
+      scoredChunks.push({
+        record,
+        denseScore: Math.max(0, dense),
+        bm25Score: bm25,
+      });
     }
 
-    // 4. Sort and Top-K filter
-    results.sort((a, b) => b.combinedScore - a.combinedScore);
-    return results.slice(0, topK);
+    // Rank with Reciprocal Rank Fusion (RRF)
+    const denseRanked = [...scoredChunks].sort((a, b) => b.denseScore - a.denseScore);
+    const bm25Ranked = [...scoredChunks].sort((a, b) => b.bm25Score - a.bm25Score);
+
+    const rrfScores = new Map<string, number>();
+    const kRRF = 60;
+
+    denseRanked.forEach((item, rank) => {
+      const id = item.record.chunk.id;
+      rrfScores.set(id, (rrfScores.get(id) || 0) + 1 / (kRRF + rank + 1));
+    });
+
+    bm25Ranked.forEach((item, rank) => {
+      const id = item.record.chunk.id;
+      rrfScores.set(id, (rrfScores.get(id) || 0) + 1 / (kRRF + rank + 1));
+    });
+
+    const finalResults: RetrievalResult[] = scoredChunks
+      .map((item) => {
+        const id = item.record.chunk.id;
+        const rrf = rrfScores.get(id) || 0;
+        const normalizedScore = Math.min(1.0, rrf * 30);
+        return {
+          chunkId: id,
+          documentId: item.record.chunk.documentId,
+          documentName: item.record.docName,
+          content: item.record.chunk.content,
+          sectionHeader: item.record.chunk.sectionHeader,
+          pageNumber: item.record.chunk.pageNumber,
+          denseScore: Math.round(item.denseScore * 1000) / 1000,
+          bm25Score: Math.round(item.bm25Score * 100) / 100,
+          combinedScore: Math.round(normalizedScore * 1000) / 1000,
+        };
+      })
+      .filter((r) => r.combinedScore >= minScore)
+      .sort((a, b) => b.combinedScore - a.combinedScore)
+      .slice(0, topK);
+
+    return {
+      results: finalResults,
+      status: 'ok',
+    };
   }
 }
 

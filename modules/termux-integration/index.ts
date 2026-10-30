@@ -1,130 +1,63 @@
-/**
- * Expo Native Module TypeScript Interface for Termux Integration
- * Controls Android RUN_COMMAND intent, Termux boot services, and loopback socket probing.
- */
+import { requireOptionalNativeModule } from 'expo-modules-core';
 
-export interface TermuxExecutionResult {
-  success: boolean;
-  message: string;
-  commandSent?: string;
-  exitCode?: number;
+type NativeTermux = {
+  isTermuxInstalled(): Promise<boolean>;
+  hasRunCommandPermission(): Promise<boolean>;
+  probeSocket(host: string, port: number, timeoutMs: number): Promise<{
+    host: string;
+    port: number;
+    isOpen: boolean;
+    latencyMs: number | null;
+    error?: string;
+  }>;
+  executeCommand(opts: {
+    executable: string;
+    arguments: string[];
+    background: boolean;
+    sessionAction: string;
+  }): Promise<{ success: boolean; message: string }>;
+};
+
+const native = requireOptionalNativeModule<NativeTermux>('TermuxIntegrationModule');
+
+export type TermuxAvailability =
+  | { available: true }
+  | { available: false; reason: 'not-android' | 'native-module-missing' };
+
+export function termuxAvailability(): TermuxAvailability {
+  if (!native) return { available: false, reason: 'native-module-missing' };
+  return { available: true };
 }
 
-export interface SocketProbeResult {
-  host: string;
-  port: number;
-  isOpen: boolean;
-  latencyMs: number | null;
+export async function isTermuxInstalled(): Promise<boolean> {
+  return native ? native.isTermuxInstalled() : false;
 }
 
-class TermuxIntegrationService {
-  /**
-   * Checks if the Termux Android application (com.termux) is installed on the device.
-   */
-  async isTermuxInstalled(): Promise<boolean> {
-    if (typeof window !== 'undefined' && !(window as any).expo?.modules?.TermuxIntegrationModule) {
-      // Browser or simulator environment
-      return true;
-    }
-    try {
-      const nativeModule = (window as any).expo?.modules?.TermuxIntegrationModule;
-      return await nativeModule.isTermuxInstalled();
-    } catch {
-      return false;
-    }
+export async function hasRunCommandPermission(): Promise<boolean> {
+  return native ? native.hasRunCommandPermission() : false;
+}
+
+export async function probeTcp(host = '127.0.0.1', port = 8080, timeoutMs = 1200) {
+  if (!native) {
+    return { host, port, isOpen: false, latencyMs: null, error: 'native-module-missing' };
   }
+  return native.probeSocket(host, port, timeoutMs);
+}
 
-  /**
-   * Checks if the com.termux.permission.RUN_COMMAND has been granted to the app.
-   */
-  async hasRunCommandPermission(): Promise<boolean> {
-    try {
-      const nativeModule = (window as any).expo?.modules?.TermuxIntegrationModule;
-      if (nativeModule) {
-        return await nativeModule.hasRunCommandPermission();
-      }
-    } catch {
-      // fallback
-    }
-    return true;
+export async function dispatchTermuxScript(scriptPath: string, engine: string, port: number) {
+  if (!native) {
+    return { success: false, message: 'Native Termux module is not available on this build.' };
   }
+  return native.executeCommand({
+    executable: '/data/data/com.termux/files/usr/bin/bash',
+    arguments: ['-c', `${scriptPath} ${engine} ${port}`],
+    background: true,
+    sessionAction: '0',
+  });
+}
 
-  /**
-   * Sends the Android RUN_COMMAND Intent to Termux to start the llama.cpp or Prism ML server in the background.
-   */
-  async startTermuxService(
-    scriptPath = '~/.termux/start_ai_service.sh',
-    engine: 'llama.cpp' | 'prism-ml' = 'llama.cpp',
-    port = 8080
-  ): Promise<TermuxExecutionResult> {
-    try {
-      const nativeModule = (window as any).expo?.modules?.TermuxIntegrationModule;
-      if (nativeModule) {
-        return await nativeModule.executeCommand({
-          executable: '/data/data/com.termux/files/usr/bin/bash',
-          arguments: ['-c', `${scriptPath} ${engine} ${port}`],
-          background: true,
-          sessionAction: '0', // 0 = run in background without creating a terminal window
-        });
-      }
-    } catch (err: any) {
-      return {
-        success: false,
-        message: `Native invocation error: ${err.message || 'Termux Intent failed'}`,
-      };
-    }
-
-    return {
-      success: true,
-      message: `Simulated launch of Termux service for ${engine} on port ${port}`,
-      commandSent: `bash -c "${scriptPath} ${engine} ${port}"`,
-    };
-  }
-
-  /**
-   * Probes a local loopback port directly via fetch / socket.
-   */
-  async probeSocket(host = '127.0.0.1', port = 8080, timeoutMs = 1200): Promise<SocketProbeResult> {
-    const startTime = performance.now();
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-      // Attempt minimal ping to loopback HTTP server
-      const res = await fetch(`http://${host}:${port}/health`, {
-        method: 'GET',
-        signal: controller.signal,
-      }).catch(async () => {
-        // Fallback root fetch
-        return await fetch(`http://${host}:${port}/`, {
-          method: 'GET',
-          signal: controller.signal,
-        });
-      });
-      clearTimeout(timer);
-
-      const latencyMs = Math.round(performance.now() - startTime);
-      return {
-        host,
-        port,
-        isOpen: res.status !== 0,
-        latencyMs,
-      };
-    } catch {
-      return {
-        host,
-        port,
-        isOpen: false,
-        latencyMs: null,
-      };
-    }
-  }
-
-  /**
-   * Generates the shell script the user can copy into Termux ~/.termux/start_ai_service.sh
-   */
-  generateTermuxSetupScript(): string {
-    return `#!/data/data/com.termux/files/usr/bin/bash
+export function generateTermuxSetupScript(): string {
+  return `#!/data/data/com.termux/files/usr/bin/bash
 # ==============================================================================
 # CloverPal Offline AI — Termux Background Engine Launcher
 # Place this at: ~/.termux/start_ai_service.sh
@@ -134,8 +67,20 @@ class TermuxIntegrationService {
 ENGINE="\${1:-llama.cpp}"
 PORT="\${2:-8080}"
 MODELS_DIR="$HOME/models"
+ENV_FILE="$HOME/.termux/ai.env"
+
+# Load explicit configuration if present
+if [ -f "$ENV_FILE" ]; then
+    . "$ENV_FILE"
+fi
 
 mkdir -p "$MODELS_DIR"
+
+# Prevent duplicate background servers on the same port
+if pgrep -f "llama-server.*--port $PORT" > /dev/null; then
+    echo "[CloverPal] Server already active on port $PORT"
+    exit 0
+fi
 
 # Acquire wake lock to keep Termux active in background
 termux-wake-lock 2>/dev/null || true
@@ -143,23 +88,24 @@ termux-wake-lock 2>/dev/null || true
 echo "[CloverPal] Starting AI Engine: $ENGINE on port $PORT..."
 
 if [ "$ENGINE" = "llama.cpp" ]; then
-    # Look for any .gguf model in ~/models
-    MODEL_PATH=$(find "$MODELS_DIR" -name "*.gguf" | head -n 1)
-    if [ -z "$MODEL_PATH" ]; then
-        echo "[ERROR] No .gguf model found in $MODELS_DIR"
-        echo "Please download a model: curl -L -o $MODELS_DIR/llama-3.2-3b.Q4_K_M.gguf <URL>"
+    MODEL_PATH="\${LLAMA_MODEL_PATH:-}"
+    if [ -z "$MODEL_PATH" ] || [ ! -f "$MODEL_PATH" ]; then
+        MODEL_PATH=$(find "$MODELS_DIR" -name "*.gguf" | head -n 1)
+    fi
+
+    if [ -z "$MODEL_PATH" ] || [ ! -f "$MODEL_PATH" ]; then
+        echo "[ERROR] No .gguf model found in $MODELS_DIR or specified in $ENV_FILE"
         exit 1
     fi
+
     echo "[CloverPal] Launching llama-server with $MODEL_PATH..."
     exec llama-server \\
         -m "$MODEL_PATH" \\
         --host 127.0.0.1 \\
         --port "$PORT" \\
         -c 4096 \\
-        -ngl 99 \\
         -t 4 \\
         --embedding \\
-        --cont-batching \\
         --slots
 elif [ "$ENGINE" = "prism-ml" ]; then
     echo "[CloverPal] Launching Prism ML Server on port $PORT..."
@@ -170,7 +116,4 @@ elif [ "$ENGINE" = "prism-ml" ]; then
         --threads 4
 fi
 `;
-  }
 }
-
-export const termuxIntegration = new TermuxIntegrationService();

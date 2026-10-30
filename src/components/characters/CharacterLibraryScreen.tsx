@@ -1,44 +1,58 @@
 /**
- * CharacterLibraryScreen
- * Displays character cards with CloverPal visual aesthetics, categories, search,
- * character editor modal, and Character Card V2 JSON import/export.
+ * CharacterLibraryScreen - React Native persona gallery and editor
+ * Supports Character Card V2 JSON export/import via expo-document-picker and expo-sharing.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  Plus,
-  Search,
-  MessageSquare,
-  Edit2,
-  Trash2,
-  Download,
-  Upload,
-  Sparkles,
-  BookOpen,
-  Code,
-  Heart,
-  X,
-  Check,
-} from 'lucide-react';
-import { CharacterCard, ResponseFormattingMode } from '../../types';
-import { db } from '../../services/database/SQLiteDatabase';
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  FlatList,
+  Modal,
+  StyleSheet,
+  Alert,
+  ScrollView,
+} from 'react-native';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
+import { Plus, Upload, Download, Edit2, Trash2, X, Sparkles } from 'lucide-react-native';
+import { theme } from '../../theme/theme';
+import { CharacterCard } from '../../types';
+import {
+  deleteCharacter,
+  getCharacters,
+  saveCharacter,
+} from '../../services/database/db';
+import { PersonaAvatar } from '../common/PersonaAvatar';
 
 interface CharacterLibraryScreenProps {
-  onStartChatWithCharacter: (character: CharacterCard) => void;
+  onStartChat: (char: CharacterCard) => void;
 }
 
 export const CharacterLibraryScreen: React.FC<CharacterLibraryScreenProps> = ({
-  onStartChatWithCharacter,
+  onStartChat,
 }) => {
-  const [characters, setCharacters] = useState<CharacterCard[]>(db.getCharacters());
+  const [characters, setCharacters] = useState<CharacterCard[]>([]);
+  const [selectedCategory, setSelectedCategory] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedCategory, setSelectedCategory] = useState<string>('All');
   const [editingCard, setEditingCard] = useState<CharacterCard | null>(null);
-  const [isCreatingNew, setIsCreatingNew] = useState(false);
+  const [isNew, setIsNew] = useState(false);
 
   const categories = ['All', 'Companion', 'Technical', 'Academic', 'Creative'];
 
-  const filteredCharacters = characters.filter((c) => {
+  useEffect(() => {
+    loadCharacters();
+  }, []);
+
+  const loadCharacters = async () => {
+    const list = await getCharacters();
+    setCharacters(list);
+  };
+
+  const filtered = characters.filter((c) => {
     const matchesSearch =
       c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       c.tagline.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -47,113 +61,124 @@ export const CharacterLibraryScreen: React.FC<CharacterLibraryScreenProps> = ({
     return matchesSearch && matchesCat;
   });
 
-  const handleSaveCharacter = (card: CharacterCard) => {
-    db.saveCharacter(card);
-    setCharacters(db.getCharacters());
-    setEditingCard(null);
-    setIsCreatingNew(false);
+  const handleDelete = (id: string, name: string) => {
+    Alert.alert('Delete Character', `Are you sure you want to delete ${name}?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          await deleteCharacter(id);
+          await loadCharacters();
+        },
+      },
+    ]);
   };
 
-  const handleDeleteCharacter = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (confirm('Delete this character card?')) {
-      db.deleteCharacter(id);
-      setCharacters(db.getCharacters());
+  const handleExport = async (char: CharacterCard) => {
+    try {
+      const exportData = {
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        data: {
+          name: char.name,
+          description: char.tagline,
+          personality: char.personality,
+          system_prompt: char.systemPrompt,
+          first_mes: char.greetingMessage,
+          mes_example: char.exampleDialogue,
+          creator_notes: 'CloverPal Offline AI',
+          category: char.category,
+        },
+      };
+
+      const path = `${FileSystem.cacheDirectory}${char.name.toLowerCase().replace(/\s+/g, '_')}_card.json`;
+      await FileSystem.writeAsStringAsync(path, JSON.stringify(exportData, null, 2), {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(path, { mimeType: 'application/json' });
+      } else {
+        Alert.alert('Exported', `Saved to ${path}`);
+      }
+    } catch (err: any) {
+      Alert.alert('Export Failed', err.message);
     }
   };
 
-  const handleExportCard = (card: CharacterCard, e: React.MouseEvent) => {
-    e.stopPropagation();
-    // Character Card V2 export format
-    const exportData = {
-      spec: 'chara_card_v2',
-      spec_version: '2.0',
-      data: {
-        name: card.name,
-        description: card.tagline,
-        personality: card.personality,
-        system_prompt: card.systemPrompt,
-        first_mes: card.greetingMessage,
-        mes_example: card.exampleDialogue,
-        creator_notes: 'Created in CloverPal Offline AI Client',
-        category: card.category,
-      },
-    };
-    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${card.name.toLowerCase().replace(/\s+/g, '_')}_card.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleImport = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: 'application/json',
+        copyToCacheDirectory: true,
+      });
+
+      if (result.canceled || !result.assets?.[0]) return;
+
+      const fileUri = result.assets[0].uri;
+      const text = await FileSystem.readAsStringAsync(fileUri, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+
+      const json = JSON.parse(text);
+      const data = json.data || json;
+
+      const newChar: CharacterCard = {
+        id: `char-${Date.now()}`,
+        name: data.name || 'Imported Persona',
+        tagline: data.description || 'Custom character',
+        description: data.description || '',
+        avatarKey: 'default',
+        personality: data.personality || '',
+        systemPrompt: data.system_prompt || 'You are an offline assistant.',
+        greetingMessage: data.first_mes || 'Hello!',
+        exampleDialogue: data.mes_example || '',
+        category: data.category || 'Companion',
+        responseMode: 'detailed',
+        memoryScope: 'private',
+        createdAt: Date.now(),
+      };
+
+      await saveCharacter(newChar);
+      await loadCharacters();
+      Alert.alert('Imported', `Imported ${newChar.name} successfully.`);
+    } catch (err: any) {
+      Alert.alert('Import Error', err.message || 'Invalid JSON file');
+    }
   };
 
-  const handleImportCard = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const json = JSON.parse(event.target?.result as string);
-        const data = json.data || json;
-        const newCard: CharacterCard = {
-          id: `char-${Date.now()}`,
-          name: data.name || 'Imported Persona',
-          tagline: data.description || 'Custom character',
-          description: data.description || '',
-          avatarUrl:
-            data.avatar ||
-            'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=256&h=256&q=80',
-          personality: data.personality || '',
-          systemPrompt: data.system_prompt || 'You are an offline assistant.',
-          greetingMessage: data.first_mes || 'Greetings!',
-          exampleDialogue: data.mes_example || '',
-          category: data.category || 'Companion',
-          responseMode: 'detailed',
-          memoryScope: 'private',
-          createdAt: Date.now(),
-        };
-        db.saveCharacter(newCard);
-        setCharacters(db.getCharacters());
-      } catch {
-        alert('Invalid Character Card JSON');
-      }
-    };
-    reader.readAsText(file);
+  const handleSaveModal = async () => {
+    if (!editingCard || !editingCard.name.trim()) return;
+    await saveCharacter(editingCard);
+    setEditingCard(null);
+    await loadCharacters();
   };
 
   return (
-    <div className="flex flex-col h-full bg-slate-50 dark:bg-slate-950 overflow-y-auto p-4 pb-20">
+    <View style={styles.container}>
       {/* Top Header */}
-      <div className="flex items-center justify-between mb-4">
-        <div>
-          <h2 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">
-            Character Library
-          </h2>
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            Distinct offline personas with private memory scopes
-          </p>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors cursor-pointer shadow-xs">
-            <Upload className="w-3.5 h-3.5" />
-            <span>Import</span>
-            <input type="file" accept=".json" onChange={handleImportCard} className="hidden" />
-          </label>
-
-          <button
-            type="button"
-            onClick={() => {
-              setIsCreatingNew(true);
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.headerTitle}>Character Library</Text>
+          <Text style={styles.headerSubtitle}>
+            Offline personas with private system prompts
+          </Text>
+        </View>
+        <View style={styles.headerActions}>
+          <Pressable style={styles.iconButton} onPress={handleImport}>
+            <Upload size={16} color={theme.colors.textPrimary} />
+          </Pressable>
+          <Pressable
+            style={styles.newButton}
+            onPress={() => {
+              setIsNew(true);
               setEditingCard({
                 id: `char-${Date.now()}`,
                 name: '',
                 tagline: '',
                 description: '',
-                avatarUrl:
-                  'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=256&h=256&q=80',
+                avatarKey: 'clover',
                 personality: '',
                 systemPrompt: '',
                 greetingMessage: '',
@@ -164,285 +189,430 @@ export const CharacterLibraryScreen: React.FC<CharacterLibraryScreenProps> = ({
                 createdAt: Date.now(),
               });
             }}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 transition-colors shadow-xs"
           >
-            <Plus className="w-4 h-4" />
-            <span>New Persona</span>
-          </button>
-        </div>
-      </div>
+            <Plus size={16} color="#ffffff" />
+            <Text style={styles.newButtonText}>New</Text>
+          </Pressable>
+        </View>
+      </View>
 
-      {/* Search Bar & Categories */}
-      <div className="space-y-3 mb-5">
-        <div className="relative">
-          <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search characters by name, traits, or domain..."
-            className="w-full pl-10 pr-4 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40 shadow-xs"
-          />
-        </div>
+      {/* Search Input */}
+      <View style={styles.searchBox}>
+        <TextInput
+          style={styles.searchInput}
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          placeholder="Search by persona name or traits..."
+          placeholderTextColor="#64748b"
+        />
+      </View>
 
-        {/* Categories Tab Strip */}
-        <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+      {/* Categories Bar */}
+      <View style={styles.categoryScroll}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categoryContainer}>
           {categories.map((cat) => (
-            <button
+            <Pressable
               key={cat}
-              type="button"
-              onClick={() => setSelectedCategory(cat)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors ${
-                selectedCategory === cat
-                  ? 'bg-slate-900 text-white dark:bg-emerald-600 dark:text-white shadow-xs'
-                  : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 border border-slate-200 dark:border-slate-800'
-              }`}
+              style={[styles.categoryTab, selectedCategory === cat && styles.categoryTabActive]}
+              onPress={() => setSelectedCategory(cat)}
             >
-              {cat}
-            </button>
+              <Text
+                style={[
+                  styles.categoryText,
+                  selectedCategory === cat && styles.categoryTextActive,
+                ]}
+              >
+                {cat}
+              </Text>
+            </Pressable>
           ))}
-        </div>
-      </div>
+        </ScrollView>
+      </View>
 
-      {/* Character Cards Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-        {filteredCharacters.map((card) => (
-          <div
-            key={card.id}
-            onClick={() => onStartChatWithCharacter(card)}
-            className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800/80 hover:border-emerald-500/50 dark:hover:border-emerald-500/50 transition-all cursor-pointer shadow-xs hover:shadow-md flex flex-col justify-between group relative"
+      {/* Character Cards List */}
+      <FlatList
+        data={filtered}
+        keyExtractor={(item) => item.id}
+        contentContainerStyle={styles.list}
+        renderItem={({ item }) => (
+          <Pressable
+            style={styles.card}
+            onPress={() => onStartChat(item)}
           >
-            <div>
-              <div className="flex items-start gap-3.5">
-                <img
-                  src={card.avatarUrl}
-                  alt={card.name}
-                  className="w-14 h-14 rounded-2xl object-cover ring-2 ring-emerald-500/20 shrink-0 group-hover:scale-105 transition-transform"
-                  referrerPolicy="no-referrer"
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-semibold text-sm text-slate-900 dark:text-white truncate">
-                      {card.name}
-                    </h3>
-                    <span className="text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
-                      {card.category}
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-1 mt-0.5">
-                    {card.tagline}
-                  </p>
-                  <p className="text-[12px] text-slate-600 dark:text-slate-300 line-clamp-2 mt-2 leading-relaxed">
-                    {card.description}
-                  </p>
-                </div>
-              </div>
-            </div>
+            <View style={styles.cardTop}>
+              <PersonaAvatar name={item.name} avatarKey={item.avatarKey} size={48} />
+              <View style={styles.cardInfo}>
+                <View style={styles.cardTitleRow}>
+                  <Text style={styles.cardName}>{item.name}</Text>
+                  <Text style={styles.cardCategory}>{item.category}</Text>
+                </View>
+                <Text style={styles.cardTagline} numberOfLines={1}>
+                  {item.tagline}
+                </Text>
+                <Text style={styles.cardDesc} numberOfLines={2}>
+                  {item.description}
+                </Text>
+              </View>
+            </View>
 
-            <div className="flex items-center justify-between pt-3 mt-3 border-t border-slate-100 dark:border-slate-800/60 text-xs">
-              <span className="text-[11px] text-slate-400 dark:text-slate-500">
-                Mode: {card.responseMode}
-              </span>
-
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={(e) => handleExportCard(card, e)}
-                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                  title="Export Character Card V2 JSON"
+            <View style={styles.cardActions}>
+              <Text style={styles.cardModeText}>Mode: {item.responseMode}</Text>
+              <View style={styles.cardActionIcons}>
+                <Pressable
+                  hitSlop={8}
+                  style={styles.actionIcon}
+                  onPress={() => handleExport(item)}
                 >
-                  <Download className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setEditingCard(card);
-                    setIsCreatingNew(false);
+                  <Download size={14} color="#94a3b8" />
+                </Pressable>
+                <Pressable
+                  hitSlop={8}
+                  style={styles.actionIcon}
+                  onPress={() => {
+                    setIsNew(false);
+                    setEditingCard(item);
                   }}
-                  className="p-1.5 rounded-lg text-slate-400 hover:text-emerald-600 dark:hover:text-emerald-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                  title="Edit character"
                 >
-                  <Edit2 className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => handleDeleteCharacter(card.id, e)}
-                  className="p-1.5 rounded-lg text-slate-400 hover:text-red-500 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                  title="Delete character"
+                  <Edit2 size={14} color="#94a3b8" />
+                </Pressable>
+                <Pressable
+                  hitSlop={8}
+                  style={styles.actionIcon}
+                  onPress={() => handleDelete(item.id, item.name)}
                 >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
+                  <Trash2 size={14} color="#ef4444" />
+                </Pressable>
+              </View>
+            </View>
+          </Pressable>
+        )}
+      />
 
-      {/* Edit / Create Character Modal */}
+      {/* Edit / Create Modal */}
       {editingCard && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl max-w-lg w-full max-h-[90vh] overflow-y-auto p-5 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-slate-800">
-              <h3 className="font-bold text-base text-slate-900 dark:text-white">
-                {isCreatingNew ? 'Create New Persona' : `Edit ${editingCard.name}`}
-              </h3>
-              <button
-                type="button"
-                onClick={() => setEditingCard(null)}
-                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
+        <Modal visible transparent animationType="slide" onRequestClose={() => setEditingCard(null)}>
+          <View style={styles.modalBackdrop}>
+            <View style={styles.modalSheet}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalSheetTitle}>
+                  {isNew ? 'Create Persona' : `Edit ${editingCard.name}`}
+                </Text>
+                <Pressable onPress={() => setEditingCard(null)}>
+                  <X size={20} color="#94a3b8" />
+                </Pressable>
+              </View>
 
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Name
-                </label>
-                <input
-                  type="text"
+              <ScrollView style={styles.modalForm} showsVerticalScrollIndicator={false}>
+                <Text style={styles.label}>Name</Text>
+                <TextInput
+                  style={styles.input}
                   value={editingCard.name}
-                  onChange={(e) => setEditingCard({ ...editingCard, name: e.target.value })}
+                  onChangeText={(v) => setEditingCard({ ...editingCard, name: v })}
                   placeholder="e.g. Athena"
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white"
+                  placeholderTextColor="#64748b"
                 />
-              </div>
 
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Tagline
-                </label>
-                <input
-                  type="text"
+                <Text style={styles.label}>Tagline</Text>
+                <TextInput
+                  style={styles.input}
                   value={editingCard.tagline}
-                  onChange={(e) => setEditingCard({ ...editingCard, tagline: e.target.value })}
+                  onChangeText={(v) => setEditingCard({ ...editingCard, tagline: v })}
                   placeholder="e.g. Polymath Research Scholar"
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white"
+                  placeholderTextColor="#64748b"
                 />
-              </div>
 
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Avatar Image URL
-                </label>
-                <input
-                  type="text"
-                  value={editingCard.avatarUrl}
-                  onChange={(e) => setEditingCard({ ...editingCard, avatarUrl: e.target.value })}
-                  placeholder="https://..."
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white font-mono text-[11px]"
+                <Text style={styles.label}>Category</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editingCard.category}
+                  onChangeText={(v) => setEditingCard({ ...editingCard, category: v })}
+                  placeholder="Companion / Technical / Academic / Creative"
+                  placeholderTextColor="#64748b"
                 />
-              </div>
 
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                    Category
-                  </label>
-                  <select
-                    value={editingCard.category}
-                    onChange={(e) => setEditingCard({ ...editingCard, category: e.target.value })}
-                    className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white"
-                  >
-                    {categories.filter((c) => c !== 'All').map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                    Response Style
-                  </label>
-                  <select
-                    value={editingCard.responseMode}
-                    onChange={(e) =>
-                      setEditingCard({
-                        ...editingCard,
-                        responseMode: e.target.value as ResponseFormattingMode,
-                      })
-                    }
-                    className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white"
-                  >
-                    <option value="automatic">Automatic</option>
-                    <option value="detailed">Detailed</option>
-                    <option value="concise">Concise</option>
-                    <option value="coding">Coding</option>
-                    <option value="analytical">Analytical</option>
-                    <option value="markdown">Markdown</option>
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Personality & Tone
-                </label>
-                <textarea
+                <Text style={styles.label}>Personality</Text>
+                <TextInput
+                  style={[styles.input, styles.multilineInput]}
                   value={editingCard.personality}
-                  onChange={(e) =>
-                    setEditingCard({ ...editingCard, personality: e.target.value })
-                  }
-                  rows={2}
-                  placeholder="e.g. Analytical, erudite, concise..."
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white"
+                  onChangeText={(v) => setEditingCard({ ...editingCard, personality: v })}
+                  multiline
+                  placeholder="e.g. Erudite, analytical, structured..."
+                  placeholderTextColor="#64748b"
                 />
-              </div>
 
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  System Prompt
-                </label>
-                <textarea
+                <Text style={styles.label}>System Prompt</Text>
+                <TextInput
+                  style={[styles.input, styles.multilineInput]}
                   value={editingCard.systemPrompt}
-                  onChange={(e) =>
-                    setEditingCard({ ...editingCard, systemPrompt: e.target.value })
-                  }
-                  rows={3}
-                  placeholder="Instructions for the local LLM when roleplaying this character..."
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white font-mono text-[11px]"
+                  onChangeText={(v) => setEditingCard({ ...editingCard, systemPrompt: v })}
+                  multiline
+                  placeholder="Directives for the local model..."
+                  placeholderTextColor="#64748b"
                 />
-              </div>
 
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Greeting Message
-                </label>
-                <textarea
+                <Text style={styles.label}>Greeting Message</Text>
+                <TextInput
+                  style={[styles.input, styles.multilineInput]}
                   value={editingCard.greetingMessage}
-                  onChange={(e) =>
-                    setEditingCard({ ...editingCard, greetingMessage: e.target.value })
-                  }
-                  rows={2}
-                  placeholder="The first greeting sent when opening a new chat..."
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white"
+                  onChangeText={(v) => setEditingCard({ ...editingCard, greetingMessage: v })}
+                  multiline
+                  placeholder="Greeting sent when opening chat..."
+                  placeholderTextColor="#64748b"
                 />
-              </div>
-            </div>
+              </ScrollView>
 
-            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-200 dark:border-slate-800">
-              <button
-                type="button"
-                onClick={() => setEditingCard(null)}
-                className="px-4 py-2 rounded-xl text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-medium"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => handleSaveCharacter(editingCard)}
-                className="px-5 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700"
-              >
-                Save Character
-              </button>
-            </div>
-          </div>
-        </div>
+              <View style={styles.modalActions}>
+                <Pressable style={styles.cancelBtn} onPress={() => setEditingCard(null)}>
+                  <Text style={styles.cancelBtnText}>Cancel</Text>
+                </Pressable>
+                <Pressable style={styles.saveBtn} onPress={handleSaveModal}>
+                  <Text style={styles.saveBtnText}>Save</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
       )}
-    </div>
+    </View>
   );
 };
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: theme.colors.bgCanvas,
+  },
+  header: {
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 8,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+    backgroundColor: theme.colors.bgSurface,
+  },
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+  },
+  headerSubtitle: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+  },
+  headerActions: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+  },
+  iconButton: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: theme.colors.bgCard,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  newButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: theme.colors.emerald,
+  },
+  newButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#ffffff',
+  },
+  searchBox: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  searchInput: {
+    backgroundColor: theme.colors.bgSurface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 13,
+    color: theme.colors.textPrimary,
+  },
+  categoryScroll: {
+    marginBottom: 6,
+  },
+  categoryContainer: {
+    paddingHorizontal: 16,
+    gap: 6,
+  },
+  categoryTab: {
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: theme.colors.bgSurface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  categoryTabActive: {
+    backgroundColor: theme.colors.emeraldDark,
+    borderColor: theme.colors.emerald,
+  },
+  categoryText: {
+    fontSize: 11.5,
+    color: theme.colors.textSecondary,
+  },
+  categoryTextActive: {
+    color: '#ffffff',
+    fontWeight: '700',
+  },
+  list: {
+    padding: 16,
+    gap: 12,
+  },
+  card: {
+    backgroundColor: theme.colors.bgSurface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 14,
+    padding: 14,
+    gap: 10,
+  },
+  cardTop: {
+    flexDirection: 'row',
+    gap: 12,
+    alignItems: 'flex-start',
+  },
+  cardInfo: {
+    flex: 1,
+  },
+  cardTitleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  cardName: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+  },
+  cardCategory: {
+    fontSize: 11,
+    color: theme.colors.emeraldText,
+    fontWeight: '600',
+  },
+  cardTagline: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    marginTop: 1,
+  },
+  cardDesc: {
+    fontSize: 12,
+    color: '#cbd5e1',
+    lineHeight: 17,
+    marginTop: 4,
+  },
+  cardActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#1e293b',
+  },
+  cardModeText: {
+    fontSize: 11,
+    color: '#64748b',
+    fontFamily: 'monospace',
+  },
+  cardActionIcons: {
+    flexDirection: 'row',
+    gap: 10,
+    alignItems: 'center',
+  },
+  actionIcon: {
+    padding: 4,
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'flex-end',
+  },
+  modalSheet: {
+    backgroundColor: theme.colors.bgSurface,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: 18,
+    maxHeight: '88%',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  modalSheetTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+  },
+  modalForm: {
+    maxHeight: 400,
+  },
+  label: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: theme.colors.textSecondary,
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  input: {
+    backgroundColor: theme.colors.bgInput,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    fontSize: 13,
+    color: theme.colors.textPrimary,
+  },
+  multilineInput: {
+    minHeight: 60,
+    textAlignVertical: 'top',
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 14,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: theme.colors.border,
+  },
+  cancelBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  cancelBtnText: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+  },
+  saveBtn: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: theme.colors.emerald,
+  },
+  saveBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#ffffff',
+  },
+});

@@ -1,17 +1,20 @@
 /**
  * PersonalMemoryService
- * Manages explicit and extracted long-term user facts and preferences with relevance search.
+ * Manages explicit and recorded user facts and preferences via async SQLite repository.
  */
 
 import { PersonalMemory } from '../../types';
-import { db } from '../database/SQLiteDatabase';
+import { deleteMemory, getMemories, saveMemory } from '../database/db';
 
 export class PersonalMemoryService {
-  public getMemories(): PersonalMemory[] {
-    return db.getMemories();
+  public async getMemories(): Promise<PersonalMemory[]> {
+    return getMemories();
   }
 
-  public saveMemory(memory: Omit<PersonalMemory, 'id' | 'createdAt' | 'updatedAt'>, id?: string): PersonalMemory {
+  public async saveMemory(
+    memory: Omit<PersonalMemory, 'id' | 'createdAt' | 'updatedAt'>,
+    id?: string
+  ): Promise<PersonalMemory> {
     const mem: PersonalMemory = {
       id: id || `mem-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       category: memory.category,
@@ -21,21 +24,20 @@ export class PersonalMemoryService {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
-    db.saveMemory(mem);
+    await saveMemory(mem);
     return mem;
   }
 
-  public deleteMemory(id: string): void {
-    db.deleteMemory(id);
+  public async deleteMemory(id: string): Promise<void> {
+    await deleteMemory(id);
   }
 
-  public searchMemories(query: string): PersonalMemory[] {
+  public async searchMemories(query: string): Promise<PersonalMemory[]> {
+    const all = await this.getMemories();
     const lower = query.toLowerCase().trim();
-    if (!lower) return this.getMemories();
-    return this.getMemories().filter(
-      (m) =>
-        m.content.toLowerCase().includes(lower) ||
-        m.category.toLowerCase().includes(lower)
+    if (!lower) return all;
+    return all.filter(
+      (m) => m.content.toLowerCase().includes(lower) || m.category.toLowerCase().includes(lower)
     );
   }
 }

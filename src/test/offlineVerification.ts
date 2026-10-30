@@ -32,9 +32,12 @@ export async function runOfflineVerificationSuite(): Promise<TestReport[]> {
 
   // Test 2: Local Vector Math Test
   const start2 = performance.now();
-  const vec1 = await embeddingService.getEmbedding('Snapdragon ARM64 compilation');
-  const vec2 = await embeddingService.getEmbedding('Snapdragon ARM64 architecture');
-  const vec3 = await embeddingService.getEmbedding('Baking chocolate chip cookies');
+  const res1 = await embeddingService.getEmbedding('Snapdragon ARM64 compilation', { allowKeywordFallback: true });
+  const res2 = await embeddingService.getEmbedding('Snapdragon ARM64 architecture', { allowKeywordFallback: true });
+  const res3 = await embeddingService.getEmbedding('Baking chocolate chip cookies', { allowKeywordFallback: true });
+  const vec1 = res1.vector;
+  const vec2 = res2.vector;
+  const vec3 = res3.vector;
   const simRelated = embeddingService.cosineSimilarity(vec1, vec2);
   const simUnrelated = embeddingService.cosineSimilarity(vec1, vec3);
   const mathPass = simRelated > simUnrelated && vec1.length === 384;

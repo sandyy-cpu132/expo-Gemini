@@ -1,5 +1,6 @@
 /**
- * Core Domain Types for CloverPal Offline AI Client
+ * Domain Types for CloverPal Offline AI Client
+ * Strictly offline, zero cloud API dependencies.
  */
 
 export type EngineType = 'llama.cpp' | 'prism-ml';
@@ -66,6 +67,7 @@ export interface GenerationStats {
   promptMs: number;
   evalMs: number;
   tokensPerSecond: number;
+  isEstimated?: boolean;
 }
 
 export interface Citation {
@@ -76,6 +78,11 @@ export interface Citation {
   sectionHeader?: string;
   excerpt: string;
   relevanceScore: number;
+}
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
 }
 
 export interface Message {
@@ -90,7 +97,7 @@ export interface Message {
   formatMode?: ResponseFormattingMode;
   stats?: GenerationStats;
   createdAt: number;
-  status?: 'sending' | 'streaming' | 'complete' | 'error';
+  status?: 'sending' | 'streaming' | 'complete' | 'interrupted' | 'error';
 }
 
 export interface CharacterCard {
@@ -98,7 +105,7 @@ export interface CharacterCard {
   name: string;
   tagline: string;
   description: string;
-  avatarUrl: string;
+  avatarKey: string;
   personality: string;
   systemPrompt: string;
   greetingMessage: string;
@@ -113,7 +120,6 @@ export interface GroupChat {
   id: string;
   name: string;
   description: string;
-  avatarUrl?: string;
   characterIds: string[];
   turnMode: 'round-robin' | 'auto-moderated' | 'manual-mention';
   activeCharacterId?: string;
@@ -134,11 +140,19 @@ export interface Conversation {
   activeCollectionIds?: string[];
 }
 
+export interface DocumentCollection {
+  id: string;
+  name: string;
+  description: string;
+  color: string;
+  createdAt: number;
+}
+
 export interface DocumentMetadata {
   id: string;
   collectionId: string;
   name: string;
-  fileType: 'pdf' | 'txt' | 'md' | 'docx' | 'csv' | 'json' | 'code';
+  fileType: 'txt' | 'md' | 'csv' | 'json' | 'code';
   fileSize: number;
   pageCount?: number;
   chunkCount: number;
@@ -151,6 +165,8 @@ export interface DocumentChunk {
   chunkIndex: number;
   content: string;
   embedding?: number[];
+  embedding_model?: string;
+  embedding_dim?: number;
   tokenCount: number;
   pageNumber?: number;
   sectionHeader?: string;
@@ -168,6 +184,7 @@ export interface PersonalMemory {
 
 export interface TermuxRuntimeConfig {
   llamaBaseUrl: string;
+  embeddingBaseUrl: string;
   prismBaseUrl: string;
   selectedEngine: EngineType;
   autoConnectOnLaunch: boolean;
@@ -182,6 +199,8 @@ export interface RuntimeDiagnostics {
   termuxRunCommandPermission: boolean;
   llamaStatus: EngineStatus;
   llamaLatencyMs: number | null;
+  embeddingServerStatus: EngineStatus;
+  embeddingLatencyMs: number | null;
   prismStatus: EngineStatus;
   prismLatencyMs: number | null;
   activePort: number;

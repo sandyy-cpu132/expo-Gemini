@@ -1,11 +1,11 @@
 /**
  * GroupChatOrchestrator
- * Coordinates multi-character conversations with safe turn-taking, loop-prevention,
- * manual interrupts, and shared conversation context.
+ * Coordinates multi-character group conversations with turn taking,
+ * loop prevention, and shared context.
  */
 
-import { CharacterCard, GroupChat, Message } from '../../types';
-import { db } from '../database/SQLiteDatabase';
+import { CharacterCard, ChatMessage, GroupChat, Message } from '../../types';
+import { getCharacters, getMessages, saveMessage } from '../database/db';
 import { runtimeManager } from '../runtime/RuntimeConnectionManager';
 
 export interface GroupTurnEvent {
@@ -18,7 +18,7 @@ export class GroupChatOrchestrator {
   private isOrchestrating = false;
   private currentTurnIndex = 0;
   private loopGuardCounter = 0;
-  private maxConsecutiveCharacterTurns = 3; // Prevent infinite AI-to-AI loops
+  private maxConsecutiveCharacterTurns = 3;
 
   public stopOrchestration() {
     this.isOrchestrating = false;
@@ -29,9 +29,6 @@ export class GroupChatOrchestrator {
     return this.isOrchestrating;
   }
 
-  /**
-   * Evaluates the next character to speak in a multi-character group conversation.
-   */
   public selectNextSpeaker(
     group: GroupChat,
     recentMessages: Message[],
@@ -46,7 +43,6 @@ export class GroupChatOrchestrator {
     }
 
     if (group.turnMode === 'manual-mention') {
-      // Look for @Name in the last user message
       const lastUserMsg = [...recentMessages].reverse().find((m) => m.senderType === 'user');
       if (lastUserMsg) {
         for (const c of characters) {
@@ -58,23 +54,23 @@ export class GroupChatOrchestrator {
       return characters[0];
     }
 
-    // Auto-moderated: pick character whose expertise best aligns or who hasn't spoken recently
+    // Auto-moderated
     const lastSpeakerId = recentMessages[recentMessages.length - 1]?.senderId;
     const candidates = characters.filter((c) => c.id !== lastSpeakerId);
-    return candidates.length > 0 ? candidates[Math.floor(Math.random() * candidates.length)] : characters[0];
+    return candidates.length > 0
+      ? candidates[Math.floor(Math.random() * candidates.length)]
+      : characters[0];
   }
 
-  /**
-   * Executes a controlled group response turn.
-   */
   public async executeGroupTurn(
     conversationId: string,
     group: GroupChat,
     onTurnUpdate: (event: GroupTurnEvent) => void,
     specificCharacterId?: string
   ): Promise<Message | null> {
+    const allChars = await getCharacters();
     const groupCharacters = group.characterIds
-      .map((id) => db.getCharacterById(id))
+      .map((id) => allChars.find((c) => c.id === id))
       .filter((c): c is CharacterCard => !!c);
 
     if (groupCharacters.length === 0) return null;
@@ -84,8 +80,8 @@ export class GroupChatOrchestrator {
       targetCharacter = groupCharacters.find((c) => c.id === specificCharacterId) || null;
     }
 
+    const messages = await getMessages(conversationId);
     if (!targetCharacter) {
-      const messages = db.getMessages(conversationId);
       targetCharacter = this.selectNextSpeaker(group, messages, groupCharacters);
     }
 
@@ -93,7 +89,7 @@ export class GroupChatOrchestrator {
 
     if (this.loopGuardCounter >= this.maxConsecutiveCharacterTurns) {
       this.loopGuardCounter = 0;
-      return null; // Force pause for user turn
+      return null;
     }
 
     this.isOrchestrating = true;
@@ -104,28 +100,29 @@ export class GroupChatOrchestrator {
       status: 'thinking',
     });
 
-    const messages = db.getMessages(conversationId);
-    const recentDialogue = messages
-      .slice(-6)
-      .map((m) => `${m.senderName}: ${m.content}`)
-      .join('\n\n');
+    const recentTurns: ChatMessage[] = messages.slice(-5).map((m) => ({
+      role: m.senderType === 'user' ? 'user' : 'assistant',
+      content: `${m.senderName}: ${m.content}`,
+    }));
 
-    const groupSystemPrompt = `You are ${targetCharacter.name} participating in a group discussion called "${group.name}".
+    const groupSystemPrompt = `You are ${targetCharacter.name} in a collaborative room called "${group.name}".
 Personality: ${targetCharacter.personality}
 System Prompt: ${targetCharacter.systemPrompt}
+Other personas present: ${groupCharacters.map((c) => c.name).join(', ')}.
+Respond as ${targetCharacter.name}. Keep it conversational and concise. Do not speak for others.`;
 
-Other participants in this room: ${groupCharacters.map((c) => c.name).join(', ')}.
-Maintain your distinct character voice. React naturally to what the others have said. Keep your response conversational and do not speak on behalf of other participants.`;
-
-    const prompt = `Current room dialogue:\n${recentDialogue}\n\nRespond as ${targetCharacter.name}:`;
+    const chatInput: ChatMessage[] = [
+      { role: 'system', content: groupSystemPrompt },
+      ...recentTurns,
+      { role: 'user', content: `Please provide your perspective, ${targetCharacter.name}.` },
+    ];
 
     try {
       const engine = runtimeManager.getActiveEngine();
       let responseText = '';
 
       await engine.streamGenerate(
-        prompt,
-        groupSystemPrompt,
+        chatInput,
         { temperature: 0.8, maxTokens: 400 },
         (chunk) => {
           responseText += chunk.token;
@@ -133,18 +130,18 @@ Maintain your distinct character voice. React naturally to what the others have 
       );
 
       const msg: Message = {
-        id: `msg-group-${Date.now()}`,
+        id: `msg-grp-${Date.now()}`,
         conversationId,
         senderType: 'assistant',
         senderId: targetCharacter.id,
         senderName: targetCharacter.name,
-        senderAvatar: targetCharacter.avatarUrl,
+        senderAvatar: targetCharacter.avatarKey,
         content: responseText.trim(),
         createdAt: Date.now(),
         status: 'complete',
       };
 
-      db.saveMessage(msg);
+      await saveMessage(msg);
 
       onTurnUpdate({
         character: targetCharacter,

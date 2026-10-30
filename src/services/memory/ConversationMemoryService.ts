@@ -1,62 +1,54 @@
 /**
  * ConversationMemoryService
- * Manages rolling message context windows, token budgeting, and automatic conversation summarization.
+ * Builds multi-turn ChatMessage[] history arrays budgeted by token limits (estimate: ~4 chars per token).
+ * Always preserves the system prompt and the most recent turns, discarding the oldest turns when needed.
  */
 
-import { Message } from '../../types';
-import { db } from '../database/SQLiteDatabase';
+import { ChatMessage, Message } from '../../types';
+import { getMessages } from '../database/db';
 
 export class ConversationMemoryService {
   /**
-   * Retrieves messages for a conversation trimmed to fit the model's active context window budget.
+   * Builds an array of ChatMessage items fitting within maxTokenBudget.
    */
-  public getBudgetedHistory(
+  public async buildChatHistory(
     conversationId: string,
-    maxTokenBudget = 2500
-  ): { messages: Message[]; estimatedTokens: number; wasTruncated: boolean } {
-    const fullHistory = db.getMessages(conversationId);
-    if (fullHistory.length === 0) {
-      return { messages: [], estimatedTokens: 0, wasTruncated: false };
-    }
+    systemPrompt: string,
+    newUserMessage: string,
+    maxTokenBudget = 3000
+  ): Promise<ChatMessage[]> {
+    const storedMessages: Message[] = await getMessages(conversationId);
 
-    const budgeted: Message[] = [];
-    let currentTokens = 0;
-    let wasTruncated = false;
+    const systemTokens = Math.ceil(systemPrompt.length / 4);
+    const userTokens = Math.ceil(newUserMessage.length / 4);
+    let remainingBudget = maxTokenBudget - systemTokens - userTokens;
 
-    // Traverse from latest to earliest to preserve most recent turns
-    for (let i = fullHistory.length - 1; i >= 0; i--) {
-      const msg = fullHistory[i];
-      const msgTokens = Math.ceil(msg.content.length / 4);
+    const budgetedTurns: ChatMessage[] = [];
 
-      if (currentTokens + msgTokens > maxTokenBudget && budgeted.length > 0) {
-        wasTruncated = true;
-        break;
+    // Traverse stored messages from newest to oldest
+    for (let i = storedMessages.length - 1; i >= 0; i--) {
+      const msg = storedMessages[i];
+      if (!msg.content || msg.status === 'error') continue;
+
+      const role: 'user' | 'assistant' = msg.senderType === 'user' ? 'user' : 'assistant';
+      const turnTokens = Math.ceil(msg.content.length / 4);
+
+      if (remainingBudget - turnTokens < 0) {
+        break; // Stop adding older history
       }
 
-      budgeted.unshift(msg);
-      currentTokens += msgTokens;
+      budgetedTurns.unshift({ role, content: msg.content });
+      remainingBudget -= turnTokens;
     }
 
-    return {
-      messages: budgeted,
-      estimatedTokens: currentTokens,
-      wasTruncated,
-    };
-  }
+    const finalMessages: ChatMessage[] = [];
+    if (systemPrompt.trim()) {
+      finalMessages.push({ role: 'system', content: systemPrompt.trim() });
+    }
+    finalMessages.push(...budgetedTurns);
+    finalMessages.push({ role: 'user', content: newUserMessage });
 
-  /**
-   * Generates a brief algorithmic summary of conversation turns.
-   */
-  public generateHeuristicSummary(conversationId: string): string {
-    const messages = db.getMessages(conversationId);
-    if (messages.length === 0) return 'Empty conversation';
-
-    const userQueries = messages
-      .filter((m) => m.senderType === 'user')
-      .map((m) => m.content.slice(0, 40))
-      .slice(-3);
-
-    return `Conversation focused on: ${userQueries.join('; ')}...`;
+    return finalMessages;
   }
 }
 

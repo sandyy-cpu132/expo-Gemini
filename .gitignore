@@ -1,8 +1,9 @@
 node_modules/
-build/
+.expo/
 dist/
+build/
 coverage/
-.DS_Store
+android/
+ios/
 *.log
-.env*
-!.env.example
+.DS_Store

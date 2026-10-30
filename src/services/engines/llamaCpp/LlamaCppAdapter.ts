@@ -4,6 +4,7 @@
  */
 
 import {
+  ChatMessage,
   EngineCapabilities,
   EngineStatus,
   EngineType,
@@ -19,6 +20,7 @@ export class LlamaCppAdapter implements InferenceEngine {
   private currentStatus: EngineStatus = 'disconnected';
   private abortController: AbortController | null = null;
   private lastStats: GenerationStats | null = null;
+  private serverContextLength = 4096;
 
   constructor(baseUrl = 'http://127.0.0.1:8080') {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
@@ -28,7 +30,7 @@ export class LlamaCppAdapter implements InferenceEngine {
     this.currentStatus = 'connecting';
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2500);
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
 
       const res = await fetch(`${this.baseUrl}/health`, {
         method: 'GET',
@@ -38,23 +40,32 @@ export class LlamaCppAdapter implements InferenceEngine {
       clearTimeout(timeoutId);
 
       if (res.ok) {
-        this.currentStatus = 'connected';
-        return true;
-      }
-    } catch {
-      // Try fallback to props or root
-      try {
-        const ping = await fetch(`${this.baseUrl}/props`, { method: 'GET' });
-        if (ping.ok) {
+        const body = await res.json().catch(() => null);
+        if (body && (body.status === 'ok' || body.status === 'loading model')) {
           this.currentStatus = 'connected';
+          this.fetchServerProps().catch(() => {});
           return true;
         }
-      } catch {
-        // failed
       }
+    } catch {
+      // offline
     }
     this.currentStatus = 'error';
     return false;
+  }
+
+  private async fetchServerProps(): Promise<void> {
+    try {
+      const res = await fetch(`${this.baseUrl}/props`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.default_generation_settings?.n_ctx) {
+          this.serverContextLength = data.default_generation_settings.n_ctx;
+        }
+      }
+    } catch {
+      // Ignore
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -64,15 +75,19 @@ export class LlamaCppAdapter implements InferenceEngine {
 
   async getStatus(): Promise<EngineStatus> {
     try {
-      const res = await fetch(`${this.baseUrl}/health`, { method: 'GET' });
+      const res = await fetch(`${this.baseUrl}/health`);
       if (res.ok) {
-        this.currentStatus = 'connected';
-        return 'connected';
+        const body = await res.json().catch(() => null);
+        if (body && (body.status === 'ok' || body.status === 'loading model')) {
+          this.currentStatus = 'connected';
+          return 'connected';
+        }
       }
     } catch {
-      this.currentStatus = 'disconnected';
+      // unreachable
     }
-    return this.currentStatus;
+    this.currentStatus = 'disconnected';
+    return 'disconnected';
   }
 
   async getCapabilities(): Promise<EngineCapabilities> {
@@ -83,7 +98,7 @@ export class LlamaCppAdapter implements InferenceEngine {
       supportsMirostat: true,
       supportsStopSequences: true,
       supportsGrammar: true,
-      maxContextLength: 8192,
+      maxContextLength: this.serverContextLength,
     };
   }
 
@@ -92,96 +107,45 @@ export class LlamaCppAdapter implements InferenceEngine {
       const res = await fetch(`${this.baseUrl}/v1/models`);
       if (res.ok) {
         const data = await res.json();
-        if (data.data && Array.isArray(data.data)) {
+        if (data.data && Array.isArray(data.data) && data.data.length > 0) {
           return data.data.map((m: { id: string }) => ({
             id: m.id,
             name: m.id.split('/').pop() || m.id,
             engine: 'llama.cpp',
             loaded: true,
-            contextLength: 4096,
+            contextLength: this.serverContextLength,
           }));
         }
       }
     } catch {
-      // If offline/unreachable, return standard local model profile detected in Termux
+      // Server down -> return empty array (no fake success)
     }
-
-    return [
-      {
-        id: 'llama-3.2-3b-instruct-q4_k_m.gguf',
-        name: 'Llama 3.2 3B Instruct (Q4_K_M)',
-        engine: 'llama.cpp',
-        loaded: this.currentStatus === 'connected',
-        contextLength: 8192,
-        parametersSize: '3.2B',
-        quantization: 'Q4_K_M',
-      },
-      {
-        id: 'qwen2.5-3b-instruct-q4_k_m.gguf',
-        name: 'Qwen 2.5 3B Instruct (Q4_K_M)',
-        engine: 'llama.cpp',
-        loaded: false,
-        contextLength: 32768,
-        parametersSize: '3.0B',
-        quantization: 'Q4_K_M',
-      },
-      {
-        id: 'nomic-embed-text-v1.5.Q4_K_M.gguf',
-        name: 'Nomic Embed Text v1.5 (Local Embedding)',
-        engine: 'llama.cpp',
-        loaded: false,
-        contextLength: 2048,
-        parametersSize: '137M',
-        quantization: 'Q4_K_M',
-      },
-    ];
-  }
-
-  async loadModel(modelId: string): Promise<boolean> {
-    // llama.cpp server CLI typically runs single loaded model, or supports slot management
-    return true;
-  }
-
-  async unloadModel(modelId: string): Promise<boolean> {
-    return true;
+    return [];
   }
 
   async generate(
-    prompt: string,
-    systemPrompt?: string,
+    messages: ChatMessage[],
     settings?: Partial<GenerationSettings>
   ): Promise<{ text: string; stats?: GenerationStats }> {
     let fullText = '';
     let stats: GenerationStats | undefined;
 
-    await this.streamGenerate(
-      prompt,
-      systemPrompt,
-      settings,
-      (chunk) => {
-        fullText += chunk.token;
-        if (chunk.stats) stats = chunk.stats;
-      }
-    );
+    await this.streamGenerate(messages, settings, (chunk) => {
+      fullText += chunk.token;
+      if (chunk.stats) stats = chunk.stats;
+    });
 
     return { text: fullText, stats };
   }
 
   async streamGenerate(
-    prompt: string,
-    systemPrompt: string | undefined,
+    messages: ChatMessage[],
     settings: Partial<GenerationSettings> | undefined,
     onChunk: (chunk: GenerationChunk) => void,
     signal?: AbortSignal
   ): Promise<void> {
     this.abortController = new AbortController();
     const effectiveSignal = signal || this.abortController.signal;
-
-    const messages = [];
-    if (systemPrompt) {
-      messages.push({ role: 'system', content: systemPrompt });
-    }
-    messages.push({ role: 'user', content: prompt });
 
     const requestBody = {
       messages,
@@ -194,7 +158,7 @@ export class LlamaCppAdapter implements InferenceEngine {
       frequency_penalty: settings?.frequencyPenalty ?? 0.0,
       max_tokens: settings?.maxTokens ?? 2048,
       stream: true,
-      stop: settings?.stopSequences ?? ['<|eot_id|>', '<|end_of_text|>', 'User:', 'Human:'],
+      stop: settings?.stopSequences ?? ['<|eot_id|>', '<|end_of_text|>'],
     };
 
     const startTime = performance.now();
@@ -213,11 +177,16 @@ export class LlamaCppAdapter implements InferenceEngine {
       });
 
       if (!response.ok) {
-        throw new Error(`llama.cpp server error: ${response.status} ${response.statusText}`);
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`llama.cpp error (${response.status}): ${errorText.slice(0, 200)}`);
       }
 
       if (!response.body) {
-        throw new Error('Response body is null');
+        // Fallback for non-streaming environments: read json
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content || '';
+        onChunk({ token: content, isFinished: true });
+        return;
       }
 
       const reader = response.body.getReader();
@@ -241,12 +210,13 @@ export class LlamaCppAdapter implements InferenceEngine {
             const evalMs = totalMs - promptTime;
             const tps = tokenCount > 0 && evalMs > 0 ? (tokenCount / evalMs) * 1000 : 0;
             const stats: GenerationStats = {
-              promptTokens: Math.ceil(prompt.length / 4),
+              promptTokens: Math.ceil(JSON.stringify(messages).length / 4),
               completionTokens: tokenCount,
-              totalTokens: Math.ceil(prompt.length / 4) + tokenCount,
+              totalTokens: Math.ceil(JSON.stringify(messages).length / 4) + tokenCount,
               promptMs: Math.round(promptTime),
               evalMs: Math.round(evalMs),
               tokensPerSecond: Math.round(tps * 10) / 10,
+              isEstimated: true,
             };
             this.lastStats = stats;
             onChunk({ token: '', isFinished: true, stats });
@@ -264,38 +234,40 @@ export class LlamaCppAdapter implements InferenceEngine {
                 tokenCount++;
                 onChunk({ token: delta, isFinished: false });
               }
-              // Extract usage if available
-              if (json.usage) {
+
+              // Extract real timings if server provided them
+              if (json.timings) {
+                const timings = json.timings;
+                this.lastStats = {
+                  promptTokens: timings.prompt_n || 0,
+                  completionTokens: timings.predicted_n || tokenCount,
+                  totalTokens: (timings.prompt_n || 0) + (timings.predicted_n || tokenCount),
+                  promptMs: Math.round(timings.prompt_ms || promptTime),
+                  evalMs: Math.round(timings.predicted_ms || 0),
+                  tokensPerSecond: Math.round((timings.predicted_per_second || 0) * 10) / 10,
+                  isEstimated: false,
+                };
+              } else if (json.usage) {
                 const totalMs = performance.now() - startTime;
-                const stats: GenerationStats = {
-                  promptTokens: json.usage.prompt_tokens || Math.ceil(prompt.length / 4),
-                  completionTokens: json.usage.completion_tokens || tokenCount,
-                  totalTokens: json.usage.total_tokens || tokenCount,
+                this.lastStats = {
+                  promptTokens: json.usage.prompt_tokens,
+                  completionTokens: json.usage.completion_tokens,
+                  totalTokens: json.usage.total_tokens,
                   promptMs: Math.round(promptTime),
                   evalMs: Math.round(totalMs - promptTime),
                   tokensPerSecond:
                     tokenCount > 0 && totalMs > 0 ? Math.round(((tokenCount / totalMs) * 1000) * 10) / 10 : 0,
+                  isEstimated: false,
                 };
-                this.lastStats = stats;
               }
             } catch {
-              // Non-JSON SSE line or chunk boundary
+              // Parse error / chunk boundary
             }
           }
         }
       }
 
-      const totalMs = performance.now() - startTime;
-      const stats: GenerationStats = {
-        promptTokens: Math.ceil(prompt.length / 4),
-        completionTokens: tokenCount,
-        totalTokens: Math.ceil(prompt.length / 4) + tokenCount,
-        promptMs: Math.round(promptTime),
-        evalMs: Math.round(totalMs - promptTime),
-        tokensPerSecond: tokenCount > 0 && totalMs > 0 ? Math.round(((tokenCount / totalMs) * 1000) * 10) / 10 : 0,
-      };
-      this.lastStats = stats;
-      onChunk({ token: '', isFinished: true, stats });
+      onChunk({ token: '', isFinished: true, stats: this.lastStats || undefined });
     } catch (err: unknown) {
       if ((err as Error)?.name === 'AbortError') {
         onChunk({ token: '', isFinished: true, stats: this.lastStats || undefined });
@@ -307,16 +279,10 @@ export class LlamaCppAdapter implements InferenceEngine {
     }
   }
 
-  async stopGeneration(): Promise<void> {
+  stopGeneration(): void {
     if (this.abortController) {
       this.abortController.abort();
       this.abortController = null;
-    }
-    // Also notify llama.cpp cancel if available
-    try {
-      fetch(`${this.baseUrl}/cancel`, { method: 'POST' }).catch(() => {});
-    } catch {
-      // ignore
     }
   }
 
@@ -327,28 +293,8 @@ export class LlamaCppAdapter implements InferenceEngine {
   getEngineInfo() {
     return {
       name: 'llama.cpp Termux Server',
-      version: 'b4500 (GGUF)',
+      version: 'GGUF HTTP Server',
       status: this.currentStatus,
     };
-  }
-
-  // Local vector embedding generation via llama.cpp embedding API
-  async getEmbedding(text: string): Promise<number[] | null> {
-    try {
-      const res = await fetch(`${this.baseUrl}/embedding`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: text }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.embedding && Array.isArray(data.embedding)) {
-          return data.embedding;
-        }
-      }
-    } catch {
-      // Endpoint might not be enabled
-    }
-    return null;
   }
 }

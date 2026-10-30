@@ -5,46 +5,29 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
+    "userInterfaceStyle": "dark",
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#090d16"
-    },
-    "ios": {
-      "supportsTablet": true
+      "backgroundColor": "#020617"
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#090d16"
+        "backgroundColor": "#020617"
       },
       "package": "com.cloverpal.offlineai",
       "permissions": [
         "com.termux.permission.RUN_COMMAND",
         "android.permission.INTERNET",
-        "android.permission.ACCESS_NETWORK_STATE",
-        "android.permission.FOREGROUND_SERVICE",
-        "android.permission.POST_NOTIFICATIONS",
-        "android.permission.RECEIVE_BOOT_COMPLETED",
-        "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.RECORD_AUDIO"
+        "android.permission.ACCESS_NETWORK_STATE"
       ]
-    },
-    "web": {
-      "favicon": "./assets/favicon.png",
-      "bundler": "metro"
     },
     "plugins": [
       "expo-router",
       "expo-sqlite",
-      [
-        "expo-font",
-        {
-          "fonts": ["./assets/fonts/Inter-Variable.ttf"]
-        }
-      ]
+      "expo-document-picker",
+      "./plugins/withTermuxManifest"
     ],
     "scheme": "cloverpal"
   }

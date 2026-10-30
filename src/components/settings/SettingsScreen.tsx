@@ -1,54 +1,58 @@
 /**
- * SettingsScreen
- * Termux connection diagnostics, engine switching, generation parameters with presets,
- * shell script exporter, dark/light theme toggle, and offline database backup.
+ * SettingsScreen - React Native Termux Connection Hub & Engine Settings
+ * Exposes live socket diagnostics, Termux setup checklist, generation parameters,
+ * and JSON database backup/restore.
  */
 
 import React, { useState, useEffect } from 'react';
 import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Alert,
+  Switch,
+} from 'react-native';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
+import {
   Terminal,
-  Activity,
-  Sliders,
-  Cpu,
-  Moon,
-  Sun,
+  RefreshCw,
+  Play,
   Download,
   Upload,
   CheckCircle2,
   AlertTriangle,
-  Copy,
-  RefreshCw,
-  Play,
-  ShieldCheck,
+  Sliders,
   HardDrive,
-  FileCode,
-} from 'lucide-react';
-import { EngineType, GenerationSettings, RuntimeDiagnostics } from '../../types';
+  Cpu,
+} from 'lucide-react-native';
+import { theme } from '../../theme/theme';
+import { RuntimeDiagnostics } from '../../types';
 import { runtimeManager } from '../../services/runtime/RuntimeConnectionManager';
-import { termuxIntegration } from '../../../modules/termux-integration';
-import { db } from '../../services/database/SQLiteDatabase';
+import {
+  dispatchTermuxScript,
+  generateTermuxSetupScript,
+} from '../../../modules/termux-integration';
+import { exportDatabaseBackup, importDatabaseBackup } from '../../services/database/db';
 
-interface SettingsScreenProps {
-  isDarkMode: boolean;
-  onToggleTheme: () => void;
-}
-
-export const SettingsScreen: React.FC<SettingsScreenProps> = ({ isDarkMode, onToggleTheme }) => {
-  const [activeEngine, setActiveEngine] = useState<EngineType>(runtimeManager.getActiveEngineType());
-  const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics>(runtimeManager.getDiagnostics());
+export const SettingsScreen: React.FC = () => {
+  const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics>(
+    runtimeManager.getDiagnostics()
+  );
   const [isProbing, setIsProbing] = useState(false);
-  const [copiedScript, setCopiedScript] = useState(false);
-  const [runCommandOutput, setRunCommandOutput] = useState<string | null>(null);
+  const [statusNote, setStatusNote] = useState<string | null>(null);
 
-  // Generation parameters
-  const [temperature, setTemperature] = useState(0.7);
-  const [topP, setTopP] = useState(0.9);
-  const [topK, setTopK] = useState(40);
-  const [minP, setMinP] = useState(0.05);
-  const [repeatPenalty, setRepeatPenalty] = useState(1.1);
-  const [maxTokens, setMaxTokens] = useState(2048);
-  const [mirostat, setMirostat] = useState<0 | 1 | 2>(0);
-  const [activePreset, setActivePreset] = useState<string>('Balanced');
+  // Generation Controls
+  const [temperature, setTemperature] = useState('0.7');
+  const [topP, setTopP] = useState('0.9');
+  const [maxTokens, setMaxTokens] = useState('2048');
+
+  // Experimental Flags
+  const [enablePrism, setEnablePrism] = useState(false);
+  const [keywordOnlyRAG, setKeywordOnlyRAG] = useState(false);
 
   useEffect(() => {
     handleProbe();
@@ -56,460 +60,460 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ isDarkMode, onTo
 
   const handleProbe = async () => {
     setIsProbing(true);
-    const diag = await runtimeManager.probeAllEngines();
+    setStatusNote(null);
+    const diag = await runtimeManager.probeAllDiagnostics();
     setDiagnostics(diag);
     setIsProbing(false);
   };
 
-  const handleSwitchEngine = async (engine: EngineType) => {
-    setActiveEngine(engine);
-    await runtimeManager.switchEngine(engine);
-    handleProbe();
+  const handleTriggerIntent = async () => {
+    setStatusNote('Dispatching com.termux.RUN_COMMAND intent...');
+    const result = await dispatchTermuxScript('~/.termux/start_ai_service.sh', 'llama.cpp', 8080);
+    setStatusNote(result.message);
+    setTimeout(handleProbe, 1500);
   };
 
-  const handleTriggerTermuxIntent = async () => {
-    setRunCommandOutput('Dispatching Android RUN_COMMAND Intent to Termux...');
-    const result = await termuxIntegration.startTermuxService(
-      '~/.termux/start_ai_service.sh',
-      activeEngine,
-      activeEngine === 'llama.cpp' ? 8080 : 8000
-    );
-    setRunCommandOutput(result.message);
-    setTimeout(handleProbe, 2000);
-  };
-
-  const applyPreset = (preset: 'Balanced' | 'Creative' | 'Precise' | 'Coding' | 'Analytical') => {
-    setActivePreset(preset);
-    switch (preset) {
-      case 'Balanced':
-        setTemperature(0.7);
-        setTopP(0.9);
-        setTopK(40);
-        setMinP(0.05);
-        setRepeatPenalty(1.1);
-        break;
-      case 'Creative':
-        setTemperature(1.0);
-        setTopP(0.95);
-        setTopK(60);
-        setMinP(0.03);
-        setRepeatPenalty(1.05);
-        break;
-      case 'Precise':
-        setTemperature(0.2);
-        setTopP(0.85);
-        setTopK(20);
-        setMinP(0.1);
-        setRepeatPenalty(1.15);
-        break;
-      case 'Coding':
-        setTemperature(0.2);
-        setTopP(0.9);
-        setTopK(30);
-        setMinP(0.08);
-        setRepeatPenalty(1.1);
-        break;
-      case 'Analytical':
-        setTemperature(0.3);
-        setTopP(0.85);
-        setTopK(25);
-        setMinP(0.05);
-        setRepeatPenalty(1.12);
-        break;
+  const handleExportBackup = async () => {
+    try {
+      const path = await exportDatabaseBackup();
+      Alert.alert('Backup Exported', `Saved to ${path}`);
+    } catch (err: any) {
+      Alert.alert('Export Failed', err.message);
     }
   };
 
-  const handleCopyScript = () => {
-    const script = termuxIntegration.generateTermuxSetupScript();
-    navigator.clipboard.writeText(script);
-    setCopiedScript(true);
-    setTimeout(() => setCopiedScript(false), 2500);
-  };
+  const handleImportBackup = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: 'application/json',
+        copyToCacheDirectory: true,
+      });
 
-  const handleExportBackup = () => {
-    const json = db.exportBackupJson();
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `cloverpal_backup_${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+      if (result.canceled || !result.assets?.[0]) return;
 
-  const handleImportBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const ok = db.importBackupJson(event.target?.result as string);
+      const fileUri = result.assets[0].uri;
+      const text = await FileSystem.readAsStringAsync(fileUri, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+
+      const ok = await importDatabaseBackup(text);
       if (ok) {
-        alert('Database backup restored successfully.');
-        window.location.reload();
+        Alert.alert('Restore Complete', 'Database restored successfully.');
       } else {
-        alert('Failed to parse backup JSON.');
+        Alert.alert('Restore Failed', 'Invalid backup format or corrupt schema.');
       }
-    };
-    reader.readAsText(file);
+    } catch (err: any) {
+      Alert.alert('Import Failed', err.message);
+    }
   };
 
   return (
-    <div className="flex flex-col h-full bg-slate-50 dark:bg-slate-950 overflow-y-auto p-4 pb-20 space-y-5">
-      {/* Top Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">
-            Settings & Termux
-          </h2>
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            Termux bridge, engine selection, generation controls, and local backup
-          </p>
-        </div>
+    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      {/* Header */}
+      <View style={styles.header}>
+        <Text style={styles.headerTitle}>Termux & Offline Settings</Text>
+        <Text style={styles.headerSubtitle}>
+          Local loopback bridge, background service controls, and engine parameters
+        </Text>
+      </View>
 
-        {/* Theme Toggle */}
-        <button
-          type="button"
-          onClick={onToggleTheme}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors shadow-xs"
-        >
-          {isDarkMode ? (
-            <>
-              <Sun className="w-4 h-4 text-amber-500" />
-              <span>Light Mode</span>
-            </>
-          ) : (
-            <>
-              <Moon className="w-4 h-4 text-indigo-500" />
-              <span>Dark Mode</span>
-            </>
-          )}
-        </button>
-      </div>
+      {/* Diagnostics Card */}
+      <View style={styles.card}>
+        <View style={styles.cardHeader}>
+          <View style={styles.cardTitleRow}>
+            <Terminal size={18} color={theme.colors.emeraldText} />
+            <Text style={styles.cardTitle}>Runtime Connectivity</Text>
+          </View>
+          <Pressable style={styles.probeBtn} onPress={handleProbe} disabled={isProbing}>
+            <RefreshCw size={13} color={theme.colors.emeraldText} />
+            <Text style={styles.probeBtnText}>Probe</Text>
+          </Pressable>
+        </View>
 
-      {/* Termux Connection Diagnostics Hub */}
-      <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800/80 shadow-xs space-y-4">
-        <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
-          <div className="flex items-center gap-2">
-            <Terminal className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-            <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
-              Termux Runtime Status
-            </h3>
-          </div>
-          <button
-            type="button"
-            onClick={handleProbe}
-            disabled={isProbing}
-            className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400 hover:underline"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${isProbing ? 'animate-spin' : ''}`} />
-            <span>Probe Sockets</span>
-          </button>
-        </div>
+        {/* Status Rows */}
+        <View style={styles.statusRows}>
+          <View style={styles.statusRow}>
+            <Text style={styles.statusLabel}>Termux App (com.termux):</Text>
+            <Text style={[styles.statusVal, diagnostics.termuxAppInstalled ? styles.valOk : styles.valErr]}>
+              {diagnostics.termuxAppInstalled ? 'Installed' : 'Not Found'}
+            </Text>
+          </View>
 
-        {/* Socket Probe Cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {/* llama.cpp Card */}
-          <div
-            className={`p-3 rounded-xl border transition-all ${
-              diagnostics.llamaStatus === 'connected'
-                ? 'border-emerald-500/60 bg-emerald-50/40 dark:bg-emerald-950/20'
-                : 'border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40'
-            }`}
-          >
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-xs text-slate-900 dark:text-white">
-                llama.cpp Engine
-              </span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-200 dark:bg-slate-800">
-                127.0.0.1:8080
-              </span>
-            </div>
-            <div className="flex items-center gap-1.5 mt-2 text-xs">
-              {diagnostics.llamaStatus === 'connected' ? (
-                <>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-                  <span className="text-emerald-700 dark:text-emerald-300 font-medium">
-                    Online ({diagnostics.llamaLatencyMs}ms)
-                  </span>
-                </>
-              ) : (
-                <>
-                  <AlertTriangle className="w-4 h-4 text-amber-500" />
-                  <span className="text-slate-500 dark:text-slate-400">Offline / Standby</span>
-                </>
-              )}
-            </div>
-          </div>
+          <View style={styles.statusRow}>
+            <Text style={styles.statusLabel}>RUN_COMMAND Permission:</Text>
+            <Text style={[styles.statusVal, diagnostics.termuxRunCommandPermission ? styles.valOk : styles.valErr]}>
+              {diagnostics.termuxRunCommandPermission ? 'Granted' : 'Missing'}
+            </Text>
+          </View>
 
-          {/* Prism ML Card */}
-          <div
-            className={`p-3 rounded-xl border transition-all ${
-              diagnostics.prismStatus === 'connected'
-                ? 'border-emerald-500/60 bg-emerald-50/40 dark:bg-emerald-950/20'
-                : 'border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40'
-            }`}
-          >
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-xs text-slate-900 dark:text-white">
-                Prism ML Engine
-              </span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-200 dark:bg-slate-800">
-                127.0.0.1:8000
-              </span>
-            </div>
-            <div className="flex items-center gap-1.5 mt-2 text-xs">
-              {diagnostics.prismStatus === 'connected' ? (
-                <>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-                  <span className="text-emerald-700 dark:text-emerald-300 font-medium">
-                    Online ({diagnostics.prismLatencyMs}ms)
-                  </span>
-                </>
-              ) : (
-                <>
-                  <AlertTriangle className="w-4 h-4 text-amber-500" />
-                  <span className="text-slate-500 dark:text-slate-400">Offline / Standby</span>
-                </>
-              )}
-            </div>
-          </div>
-        </div>
+          <View style={styles.statusRow}>
+            <Text style={styles.statusLabel}>Chat Engine (127.0.0.1:8080):</Text>
+            <Text style={[styles.statusVal, diagnostics.llamaStatus === 'connected' ? styles.valOk : styles.valErr]}>
+              {diagnostics.llamaStatus === 'connected'
+                ? `Online (${diagnostics.llamaLatencyMs}ms)`
+                : 'Offline'}
+            </Text>
+          </View>
 
-        {/* Action Buttons */}
-        <div className="flex flex-wrap items-center gap-2 pt-1">
-          <button
-            type="button"
-            onClick={handleTriggerTermuxIntent}
-            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 dark:bg-emerald-600 text-white text-xs font-semibold hover:bg-slate-800 transition-colors shadow-xs"
-          >
-            <Play className="w-3.5 h-3.5" />
-            <span>Trigger Termux RUN_COMMAND</span>
-          </button>
+          <View style={styles.statusRow}>
+            <Text style={styles.statusLabel}>Embedding Engine (127.0.0.1:8081):</Text>
+            <Text style={[styles.statusVal, diagnostics.embeddingServerStatus === 'connected' ? styles.valOk : styles.valErr]}>
+              {diagnostics.embeddingServerStatus === 'connected'
+                ? `Online (${diagnostics.embeddingLatencyMs}ms)`
+                : 'Offline'}
+            </Text>
+          </View>
+        </View>
 
-          <button
-            type="button"
-            onClick={handleCopyScript}
-            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-medium hover:bg-slate-100 transition-colors"
-          >
-            <Copy className="w-3.5 h-3.5" />
-            <span>{copiedScript ? 'Script Copied!' : 'Copy start_ai_service.sh'}</span>
-          </button>
-        </div>
-
-        {runCommandOutput && (
-          <div className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-950 font-mono text-[11px] text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-800">
-            {runCommandOutput}
-          </div>
+        {statusNote && (
+          <View style={styles.noteBox}>
+            <Text style={styles.noteText}>{statusNote}</Text>
+          </View>
         )}
-      </div>
 
-      {/* Engine Switcher */}
-      <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800/80 shadow-xs space-y-3">
-        <div className="flex items-center gap-2 pb-2 border-b border-slate-100 dark:border-slate-800">
-          <Cpu className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-          <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
-            Select Active Inference Engine
-          </h3>
-        </div>
+        {/* Intent trigger */}
+        <Pressable style={styles.startBtn} onPress={handleTriggerIntent}>
+          <Play size={14} color="#ffffff" fill="#ffffff" />
+          <Text style={styles.startBtnText}>Dispatch Termux RUN_COMMAND</Text>
+        </Pressable>
+      </View>
 
-        <div className="grid grid-cols-2 gap-3">
-          <button
-            type="button"
-            onClick={() => handleSwitchEngine('llama.cpp')}
-            className={`p-3 rounded-xl border text-left transition-all ${
-              activeEngine === 'llama.cpp'
-                ? 'border-emerald-600 bg-emerald-500/10 ring-1 ring-emerald-500/30'
-                : 'border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/50'
-            }`}
-          >
-            <div className="font-semibold text-xs text-slate-900 dark:text-white">llama.cpp</div>
-            <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-              Optimized for GGUF models, low RAM & ARM NEON
-            </div>
-          </button>
+      {/* Setup Checklist */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Termux Setup Requirements</Text>
+        <Text style={styles.checklistIntro}>
+          Before automatic startup works, ensure these 3 Android setup steps are completed:
+        </Text>
 
-          <button
-            type="button"
-            onClick={() => handleSwitchEngine('prism-ml')}
-            className={`p-3 rounded-xl border text-left transition-all ${
-              activeEngine === 'prism-ml'
-                ? 'border-emerald-600 bg-emerald-500/10 ring-1 ring-emerald-500/30'
-                : 'border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/50'
-            }`}
-          >
-            <div className="font-semibold text-xs text-slate-900 dark:text-white">Prism ML</div>
-            <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-              Custom mobile runtime adapter with configurable REST endpoints
-            </div>
-          </button>
-        </div>
-      </div>
+        <View style={styles.checkItem}>
+          <Text style={styles.checkNum}>1.</Text>
+          <Text style={styles.checkBody}>
+            Grant "Run commands in Termux" in Android App Info → CloverPal → Permissions.
+          </Text>
+        </View>
 
-      {/* Generation Parameters & Presets */}
-      <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800/80 shadow-xs space-y-4">
-        <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
-          <div className="flex items-center gap-2">
-            <Sliders className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-            <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
-              Generation Parameters
-            </h3>
-          </div>
-          <span className="text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
-            {activePreset}
-          </span>
-        </div>
+        <View style={styles.checkItem}>
+          <Text style={styles.checkNum}>2.</Text>
+          <Text style={styles.checkBody}>
+            In Termux, add <Text style={styles.monoText}>allow-external-apps=true</Text> to <Text style={styles.monoText}>~/.termux/termux.properties</Text>.
+          </Text>
+        </View>
 
-        {/* Presets Strip */}
-        <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-          {(['Balanced', 'Creative', 'Precise', 'Coding', 'Analytical'] as const).map((p) => (
-            <button
-              key={p}
-              type="button"
-              onClick={() => applyPreset(p)}
-              className={`px-3 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition-colors ${
-                activePreset === p
-                  ? 'bg-slate-900 text-white dark:bg-emerald-600'
-                  : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
-              }`}
-            >
-              {p}
-            </button>
-          ))}
-        </div>
+        <View style={styles.checkItem}>
+          <Text style={styles.checkNum}>3.</Text>
+          <Text style={styles.checkBody}>
+            Place your launcher at <Text style={styles.monoText}>~/.termux/start_ai_service.sh</Text> and run <Text style={styles.monoText}>chmod +x</Text>.
+          </Text>
+        </View>
+      </View>
 
-        {/* Sliders Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-          <div>
-            <div className="flex justify-between font-medium mb-1">
-              <span>Temperature</span>
-              <span className="font-mono text-emerald-600">{temperature.toFixed(2)}</span>
-            </div>
-            <input
-              type="range"
-              min="0.1"
-              max="2.0"
-              step="0.05"
-              value={temperature}
-              onChange={(e) => setTemperature(parseFloat(e.target.value))}
-              className="w-full accent-emerald-600"
-            />
-          </div>
+      {/* Generation Parameters */}
+      <View style={styles.card}>
+        <View style={styles.cardTitleRow}>
+          <Sliders size={18} color={theme.colors.emeraldText} />
+          <Text style={styles.cardTitle}>Generation Controls</Text>
+        </View>
 
-          <div>
-            <div className="flex justify-between font-medium mb-1">
-              <span>Top P (Nucleus)</span>
-              <span className="font-mono text-emerald-600">{topP.toFixed(2)}</span>
-            </div>
-            <input
-              type="range"
-              min="0.1"
-              max="1.0"
-              step="0.05"
-              value={topP}
-              onChange={(e) => setTopP(parseFloat(e.target.value))}
-              className="w-full accent-emerald-600"
-            />
-          </div>
+        <View style={styles.paramRow}>
+          <Text style={styles.paramLabel}>Temperature (0.1 - 1.5):</Text>
+          <TextInput
+            style={styles.paramInput}
+            value={temperature}
+            onChangeText={setTemperature}
+            keyboardType="numeric"
+          />
+        </View>
 
-          <div>
-            <div className="flex justify-between font-medium mb-1">
-              <span>Top K</span>
-              <span className="font-mono text-emerald-600">{topK}</span>
-            </div>
-            <input
-              type="range"
-              min="1"
-              max="100"
-              step="1"
-              value={topK}
-              onChange={(e) => setTopK(parseInt(e.target.value, 10))}
-              className="w-full accent-emerald-600"
-            />
-          </div>
+        <View style={styles.paramRow}>
+          <Text style={styles.paramLabel}>Top P Nucleus (0.1 - 1.0):</Text>
+          <TextInput
+            style={styles.paramInput}
+            value={topP}
+            onChangeText={setTopP}
+            keyboardType="numeric"
+          />
+        </View>
 
-          <div>
-            <div className="flex justify-between font-medium mb-1">
-              <span>Repeat Penalty</span>
-              <span className="font-mono text-emerald-600">{repeatPenalty.toFixed(2)}</span>
-            </div>
-            <input
-              type="range"
-              min="1.0"
-              max="1.5"
-              step="0.02"
-              value={repeatPenalty}
-              onChange={(e) => setRepeatPenalty(parseFloat(e.target.value))}
-              className="w-full accent-emerald-600"
-            />
-          </div>
+        <View style={styles.paramRow}>
+          <Text style={styles.paramLabel}>Max Tokens:</Text>
+          <TextInput
+            style={styles.paramInput}
+            value={maxTokens}
+            onChangeText={setMaxTokens}
+            keyboardType="numeric"
+          />
+        </View>
+      </View>
 
-          <div>
-            <div className="flex justify-between font-medium mb-1">
-              <span>Max Tokens</span>
-              <span className="font-mono text-emerald-600">{maxTokens}</span>
-            </div>
-            <input
-              type="range"
-              min="256"
-              max="4096"
-              step="256"
-              value={maxTokens}
-              onChange={(e) => setMaxTokens(parseInt(e.target.value, 10))}
-              className="w-full accent-emerald-600"
-            />
-          </div>
+      {/* Experimental Features */}
+      <View style={styles.card}>
+        <View style={styles.cardTitleRow}>
+          <Cpu size={18} color={theme.colors.amber} />
+          <Text style={styles.cardTitle}>Experimental Engine Modes</Text>
+        </View>
 
-          <div>
-            <div className="flex justify-between font-medium mb-1">
-              <span>Mirostat Mode</span>
-              <span className="font-mono text-emerald-600">
-                {mirostat === 0 ? 'Disabled' : `v${mirostat}`}
-              </span>
-            </div>
-            <select
-              value={mirostat}
-              onChange={(e) => setMirostat(parseInt(e.target.value, 10) as any)}
-              className="w-full px-2.5 py-1.5 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700"
-            >
-              <option value="0">0 - Disabled</option>
-              <option value="1">1 - Mirostat v1</option>
-              <option value="2">2 - Mirostat v2</option>
-            </select>
-          </div>
-        </div>
-      </div>
+        <View style={styles.switchRow}>
+          <View style={styles.switchInfo}>
+            <Text style={styles.switchLabel}>Enable Prism ML (Port 8000)</Text>
+            <Text style={styles.switchDesc}>
+              Experimental, not verified on hardware.
+            </Text>
+          </View>
+          <Switch
+            value={enablePrism}
+            onValueChange={setEnablePrism}
+            trackColor={{ false: '#1e293b', true: theme.colors.emeraldDark }}
+            thumbColor={enablePrism ? theme.colors.emerald : '#94a3b8'}
+          />
+        </View>
 
-      {/* Offline Database & Backup */}
-      <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800/80 shadow-xs space-y-3">
-        <div className="flex items-center gap-2 pb-2 border-b border-slate-100 dark:border-slate-800">
-          <HardDrive className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-          <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
-            Offline Storage & Backup
-          </h3>
-        </div>
+        <View style={styles.switchRow}>
+          <View style={styles.switchInfo}>
+            <Text style={styles.switchLabel}>Keyword-Only RAG Fallback</Text>
+            <Text style={styles.switchDesc}>
+              Uses 384-dim keyword hashing when embedding server on 8081 is stopped.
+            </Text>
+          </View>
+          <Switch
+            value={keywordOnlyRAG}
+            onValueChange={setKeywordOnlyRAG}
+            trackColor={{ false: '#1e293b', true: theme.colors.emeraldDark }}
+            thumbColor={keywordOnlyRAG ? theme.colors.emerald : '#94a3b8'}
+          />
+        </View>
+      </View>
 
-        <p className="text-xs text-slate-500 dark:text-slate-400">
-          All conversations, custom characters, indexed RAG chunks, and memories are stored purely
-          in local SQLite with zero external cloud sync.
-        </p>
+      {/* Database Backup */}
+      <View style={styles.card}>
+        <View style={styles.cardTitleRow}>
+          <HardDrive size={18} color={theme.colors.emeraldText} />
+          <Text style={styles.cardTitle}>SQLite Backup & Restore</Text>
+        </View>
+        <Text style={styles.checklistIntro}>
+          Export conversations, custom personas, and indexed document chunks to a JSON file.
+        </Text>
 
-        <div className="flex items-center gap-2 pt-1">
-          <button
-            type="button"
-            onClick={handleExportBackup}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-200 transition-colors"
-          >
-            <Download className="w-3.5 h-3.5" />
-            <span>Export Database JSON</span>
-          </button>
+        <View style={styles.backupBtns}>
+          <Pressable style={styles.backupBtn} onPress={handleExportBackup}>
+            <Download size={14} color="#ffffff" />
+            <Text style={styles.backupBtnText}>Export JSON</Text>
+          </Pressable>
 
-          <label className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-200 transition-colors cursor-pointer">
-            <Upload className="w-3.5 h-3.5" />
-            <span>Restore Backup</span>
-            <input type="file" accept=".json" onChange={handleImportBackup} className="hidden" />
-          </label>
-        </div>
-      </div>
-    </div>
+          <Pressable style={[styles.backupBtn, styles.restoreBtn]} onPress={handleImportBackup}>
+            <Upload size={14} color="#ffffff" />
+            <Text style={styles.backupBtnText}>Restore Backup</Text>
+          </Pressable>
+        </View>
+      </View>
+    </ScrollView>
   );
 };
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: theme.colors.bgCanvas,
+  },
+  content: {
+    padding: 16,
+    gap: 14,
+    paddingBottom: 40,
+  },
+  header: {
+    marginBottom: 4,
+  },
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+  },
+  headerSubtitle: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+  },
+  card: {
+    backgroundColor: theme.colors.bgSurface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 14,
+    padding: 16,
+    gap: 12,
+  },
+  cardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  cardTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  cardTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+  },
+  probeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: theme.colors.bgCard,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  probeBtnText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: theme.colors.emeraldText,
+  },
+  statusRows: {
+    backgroundColor: '#050b14',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: 10,
+    gap: 6,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  statusLabel: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+  },
+  statusVal: {
+    fontSize: 12,
+    fontWeight: '700',
+    fontFamily: 'monospace',
+  },
+  valOk: {
+    color: theme.colors.emeraldText,
+  },
+  valErr: {
+    color: '#ef4444',
+  },
+  noteBox: {
+    backgroundColor: '#0a101f',
+    padding: 8,
+    borderRadius: 6,
+  },
+  noteText: {
+    fontSize: 11,
+    fontFamily: 'monospace',
+    color: '#94a3b8',
+  },
+  startBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: theme.colors.emeraldDark,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  startBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#ffffff',
+  },
+  checklistIntro: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    lineHeight: 17,
+  },
+  checkItem: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'flex-start',
+  },
+  checkNum: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: theme.colors.emeraldText,
+  },
+  checkBody: {
+    fontSize: 12,
+    color: '#cbd5e1',
+    lineHeight: 17,
+    flex: 1,
+  },
+  monoText: {
+    fontFamily: 'monospace',
+    color: '#34d399',
+    backgroundColor: '#0f172a',
+  },
+  paramRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  paramLabel: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+  },
+  paramInput: {
+    backgroundColor: theme.colors.bgInput,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    fontSize: 13,
+    fontFamily: 'monospace',
+    color: theme.colors.textPrimary,
+    width: 80,
+    textAlign: 'center',
+  },
+  switchRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 4,
+  },
+  switchInfo: {
+    flex: 1,
+    paddingRight: 10,
+  },
+  switchLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: theme.colors.textPrimary,
+  },
+  switchDesc: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+  },
+  backupBtns: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  backupBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: theme.colors.bgCard,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  restoreBtn: {
+    backgroundColor: '#1e1b4b',
+    borderColor: '#4338ca',
+  },
+  backupBtnText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#ffffff',
+  },
+});

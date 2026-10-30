@@ -1,9 +1,10 @@
 /**
  * Inference Engine Abstraction Contract
- * Decouples chat UI and RAG logic from backend engine implementations (llama.cpp / Prism ML).
+ * Decouples chat UI and RAG logic from backend engine implementations.
  */
 
 import {
+  ChatMessage,
   EngineCapabilities,
   EngineStatus,
   EngineType,
@@ -27,24 +28,20 @@ export interface InferenceEngine {
   getStatus(): Promise<EngineStatus>;
   getCapabilities(): Promise<EngineCapabilities>;
   getModels(): Promise<ModelInfo[]>;
-  loadModel(modelId: string): Promise<boolean>;
-  unloadModel(modelId: string): Promise<boolean>;
-  
+
   generate(
-    prompt: string,
-    systemPrompt?: string,
+    messages: ChatMessage[],
     settings?: Partial<GenerationSettings>
   ): Promise<{ text: string; stats?: GenerationStats }>;
 
   streamGenerate(
-    prompt: string,
-    systemPrompt: string | undefined,
+    messages: ChatMessage[],
     settings: Partial<GenerationSettings> | undefined,
     onChunk: (chunk: GenerationChunk) => void,
     signal?: AbortSignal
   ): Promise<void>;
 
-  stopGeneration(): Promise<void>;
+  stopGeneration(): void;
   getGenerationStats(): GenerationStats | null;
   getEngineInfo(): { name: string; version: string; status: EngineStatus };
 }

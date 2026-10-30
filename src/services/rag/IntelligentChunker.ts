@@ -1,52 +1,32 @@
 /**
  * IntelligentChunker
- * Supports recursive, paragraph-aware, heading-aware, and parent-child chunking with configurable overlap.
+ * Character-based chunking with CHUNK_CHARS = 1200, CHUNK_OVERLAP_CHARS = 200.
+ * Splits preferentially on Markdown headings and blank lines.
  */
 
 import { DocumentChunk } from '../../types';
 
+export const CHUNK_CHARS = 1200;
+export const CHUNK_OVERLAP_CHARS = 200;
+
 export interface ChunkingOptions {
-  strategy: 'recursive' | 'paragraph' | 'heading' | 'fixed';
-  chunkSize: number; // in characters or approximate tokens
-  chunkOverlap: number;
-  preserveHeadings: boolean;
+  chunkSize?: number;
+  chunkOverlap?: number;
 }
 
 export class IntelligentChunker {
-  private defaultOptions: ChunkingOptions = {
-    strategy: 'recursive',
-    chunkSize: 600,
-    chunkOverlap: 100,
-    preserveHeadings: true,
-  };
-
-  /**
-   * Splits raw document text into structured chunks preserving section headers and page metadata.
-   */
   public chunkDocument(
     documentId: string,
     rawText: string,
-    options?: Partial<ChunkingOptions>
+    options?: ChunkingOptions
   ): DocumentChunk[] {
-    const opts = { ...this.defaultOptions, ...options };
-    const chunks: DocumentChunk[] = [];
+    const size = options?.chunkSize ?? CHUNK_CHARS;
+    const overlap = options?.chunkOverlap ?? CHUNK_OVERLAP_CHARS;
 
-    // Normalize line endings
-    const text = rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const normalized = rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const lines = normalized.split('\n');
 
-    if (opts.strategy === 'heading' || opts.preserveHeadings) {
-      return this.chunkByHeadingsAndParagraphs(documentId, text, opts);
-    }
-
-    return this.chunkRecursive(documentId, text, opts);
-  }
-
-  private chunkByHeadingsAndParagraphs(
-    documentId: string,
-    text: string,
-    opts: ChunkingOptions
-  ): DocumentChunk[] {
-    const lines = text.split('\n');
+    // Group text by heading sections first
     const sections: { header: string; content: string[] }[] = [];
     let currentHeader = 'Introduction';
     let currentLines: string[] = [];
@@ -75,9 +55,9 @@ export class IntelligentChunker {
       const sectionText = section.content.join('\n').trim();
       if (!sectionText) continue;
 
-      if (sectionText.length <= opts.chunkSize) {
+      if (sectionText.length <= size) {
         resultChunks.push({
-          id: `${documentId}-chunk-${chunkIndex}`,
+          id: `${documentId}-chk-${chunkIndex}`,
           documentId,
           chunkIndex,
           content: sectionText,
@@ -86,72 +66,49 @@ export class IntelligentChunker {
         });
         chunkIndex++;
       } else {
-        // Subdivide section with overlap
-        const subChunks = this.splitWithOverlap(sectionText, opts.chunkSize, opts.chunkOverlap);
-        for (const sub of subChunks) {
-          resultChunks.push({
-            id: `${documentId}-chunk-${chunkIndex}`,
-            documentId,
-            chunkIndex,
-            content: sub,
-            tokenCount: Math.ceil(sub.length / 4),
-            sectionHeader: section.header,
-          });
-          chunkIndex++;
-        }
-      }
-    }
+        // Split section on blank lines or sentences with overlap
+        let start = 0;
+        while (start < sectionText.length) {
+          let end = Math.min(start + size, sectionText.length);
 
-    return resultChunks.length > 0
-      ? resultChunks
-      : this.chunkRecursive(documentId, text, opts);
-  }
-
-  private chunkRecursive(
-    documentId: string,
-    text: string,
-    opts: ChunkingOptions
-  ): DocumentChunk[] {
-    const rawChunks = this.splitWithOverlap(text, opts.chunkSize, opts.chunkOverlap);
-    return rawChunks.map((content, idx) => ({
-      id: `${documentId}-chunk-${idx}`,
-      documentId,
-      chunkIndex: idx,
-      content,
-      tokenCount: Math.ceil(content.length / 4),
-    }));
-  }
-
-  private splitWithOverlap(text: string, size: number, overlap: number): string[] {
-    const result: string[] = [];
-    let startIndex = 0;
-
-    while (startIndex < text.length) {
-      let endIndex = Math.min(startIndex + size, text.length);
-
-      // Seek natural boundary (newline or period)
-      if (endIndex < text.length) {
-        const boundary = text.lastIndexOf('\n', endIndex);
-        if (boundary > startIndex + size * 0.6) {
-          endIndex = boundary + 1;
-        } else {
-          const sentenceEnd = text.lastIndexOf('. ', endIndex);
-          if (sentenceEnd > startIndex + size * 0.6) {
-            endIndex = sentenceEnd + 2;
+          if (end < sectionText.length) {
+            // Find preferred break: double newline, then newline, then sentence period
+            const doubleNl = sectionText.lastIndexOf('\n\n', end);
+            if (doubleNl > start + size * 0.5) {
+              end = doubleNl + 2;
+            } else {
+              const singleNl = sectionText.lastIndexOf('\n', end);
+              if (singleNl > start + size * 0.5) {
+                end = singleNl + 1;
+              } else {
+                const period = sectionText.lastIndexOf('. ', end);
+                if (period > start + size * 0.5) {
+                  end = period + 2;
+                }
+              }
+            }
           }
+
+          const chunkText = sectionText.slice(start, end).trim();
+          if (chunkText.length > 20) {
+            resultChunks.push({
+              id: `${documentId}-chk-${chunkIndex}`,
+              documentId,
+              chunkIndex,
+              content: chunkText,
+              tokenCount: Math.ceil(chunkText.length / 4),
+              sectionHeader: section.header,
+            });
+            chunkIndex++;
+          }
+
+          if (end >= sectionText.length) break;
+          start = Math.max(start + 1, end - overlap);
         }
       }
-
-      const chunk = text.slice(startIndex, endIndex).trim();
-      if (chunk.length > 10) {
-        result.push(chunk);
-      }
-
-      if (endIndex >= text.length) break;
-      startIndex = Math.max(startIndex + 1, endIndex - overlap);
     }
 
-    return result;
+    return resultChunks;
   }
 }
 

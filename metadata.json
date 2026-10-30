@@ -1,6 +1,0 @@
-{
-  "name": "CloverPal Offline AI — Termux Client",
-  "description": "Premium offline AI Android client inspired by CloverPal & ChatterUI. Features auto Termux connectivity, llama.cpp & Prism ML adapters, local RAG, persistent memory, and character cards.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

@@ -1,119 +1,108 @@
 /**
- * GroupChatScreen
- * Manages multi-character collaborative discussions with safe turn orchestration,
- * manual intervention, and loop prevention.
+ * GroupChatScreen - Multi-Character Group Discussions in React Native
+ * Coordinates turns safely with GroupChatOrchestrator and anti-loop guards.
  */
 
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Users,
-  Plus,
-  Play,
-  Square,
-  Sparkles,
-  Send,
-  Trash2,
-  ChevronRight,
-  ShieldAlert,
-} from 'lucide-react';
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  FlatList,
+  Modal,
+  StyleSheet,
+  Alert,
+  KeyboardAvoidingView,
+  Platform,
+} from 'react-native';
+import { Users, Plus, Send, Square, X } from 'lucide-react-native';
+import { theme } from '../../theme/theme';
 import { CharacterCard, GroupChat, Message } from '../../types';
-import { db } from '../../services/database/SQLiteDatabase';
+import {
+  getCharacters,
+  getGroups,
+  getMessages,
+  saveGroup,
+  saveMessage,
+} from '../../services/database/db';
 import { groupChatOrchestrator, GroupTurnEvent } from '../../services/group/GroupChatOrchestrator';
+import { PersonaAvatar } from '../common/PersonaAvatar';
 import { RichResponseRenderer } from '../chat/RichResponseRenderer';
 
 export const GroupChatScreen: React.FC = () => {
-  const [groups, setGroups] = useState<GroupChat[]>(db.getGroups());
-  const [activeGroup, setActiveGroup] = useState<GroupChat | null>(groups[0] || null);
+  const [groups, setGroups] = useState<GroupChat[]>([]);
+  const [activeGroup, setActiveGroup] = useState<GroupChat | null>(null);
+  const [characters, setCharacters] = useState<CharacterCard[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [isOrchestrating, setIsOrchestrating] = useState(false);
   const [currentSpeaker, setCurrentSpeaker] = useState<CharacterCard | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
 
-  // New Group Form
+  // New Group State
   const [newGroupName, setNewGroupName] = useState('');
   const [selectedCharIds, setSelectedCharIds] = useState<string[]>(['char-clover', 'char-aegis']);
-  const [turnMode, setTurnMode] = useState<'auto-moderated' | 'round-robin' | 'manual-mention'>('auto-moderated');
 
-  const allCharacters = db.getCharacters();
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const flatListRef = useRef<FlatList>(null);
 
-  // Load conversation for group
   useEffect(() => {
-    if (activeGroup) {
-      const convId = `conv-group-${activeGroup.id}`;
-      let conv = db.getConversationById(convId);
-      if (!conv) {
-        conv = {
-          id: convId,
-          title: activeGroup.name,
-          groupId: activeGroup.id,
-          engine: 'llama.cpp',
-          modelId: 'llama-3.2-3b-instruct-q4_k_m.gguf',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        };
-        db.saveConversation(conv);
-      }
-      setMessages(db.getMessages(convId));
+    loadData();
+  }, []);
+
+  const loadData = async () => {
+    const chars = await getCharacters();
+    setCharacters(chars);
+    const grps = await getGroups();
+    setGroups(grps);
+    if (grps.length > 0 && !activeGroup) {
+      setActiveGroup(grps[0]);
     }
-  }, [activeGroup]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, currentSpeaker]);
-
-  const handleCreateGroup = () => {
-    if (!newGroupName.trim() || selectedCharIds.length < 2) return;
-
-    const newGroup: GroupChat = {
-      id: `group-${Date.now()}`,
-      name: newGroupName.trim(),
-      description: `Collaborative dialogue between ${selectedCharIds.length} personas.`,
-      characterIds: selectedCharIds,
-      turnMode,
-      createdAt: Date.now(),
-    };
-
-    db.saveGroup(newGroup);
-    const updated = db.getGroups();
-    setGroups(updated);
-    setActiveGroup(newGroup);
-    setShowCreateModal(false);
-    setNewGroupName('');
   };
 
-  const handleSendUserMessage = async () => {
-    if (!inputText.trim() || !activeGroup || isOrchestrating) return;
+  useEffect(() => {
+    if (activeGroup) {
+      loadGroupMessages(activeGroup.id);
+    }
+  }, [activeGroup?.id]);
 
+  const loadGroupMessages = async (groupId: string) => {
+    const convId = `conv-group-${groupId}`;
+    const msgs = await getMessages(convId);
+    setMessages(msgs);
+  };
+
+  const handleSend = async () => {
+    const text = inputText.trim();
+    if (!text || !activeGroup || isOrchestrating) return;
+
+    setInputText('');
     const convId = `conv-group-${activeGroup.id}`;
+
     const userMsg: Message = {
-      id: `msg-${Date.now()}-u`,
+      id: `msg-grp-${Date.now()}-u`,
       conversationId: convId,
       senderType: 'user',
       senderName: 'You',
-      content: inputText.trim(),
+      content: text,
       createdAt: Date.now(),
       status: 'complete',
     };
 
-    db.saveMessage(userMsg);
+    await saveMessage(userMsg);
     setMessages((prev) => [...prev, userMsg]);
-    setInputText('');
     groupChatOrchestrator.resetLoopGuard();
 
-    // Trigger next turn
-    handleNextTurn(convId);
+    triggerNextTurn(convId);
   };
 
-  const handleNextTurn = async (convId?: string, forcedCharId?: string) => {
+  const triggerNextTurn = async (convId: string, forcedCharId?: string) => {
     if (!activeGroup || isOrchestrating) return;
-    const targetConvId = convId || `conv-group-${activeGroup.id}`;
 
     setIsOrchestrating(true);
     try {
       await groupChatOrchestrator.executeGroupTurn(
-        targetConvId,
+        convId,
         activeGroup,
         (event: GroupTurnEvent) => {
           if (event.status === 'thinking') {
@@ -121,7 +110,7 @@ export const GroupChatScreen: React.FC = () => {
           } else if (event.status === 'completed' && event.message) {
             setMessages((prev) => [...prev, event.message!]);
             setCurrentSpeaker(null);
-          } else if (event.status === 'skipped') {
+          } else {
             setCurrentSpeaker(null);
           }
         },
@@ -139,304 +128,466 @@ export const GroupChatScreen: React.FC = () => {
     setCurrentSpeaker(null);
   };
 
+  const handleCreateGroup = async () => {
+    if (!newGroupName.trim() || selectedCharIds.length < 2) {
+      Alert.alert('Incomplete', 'Enter a name and select at least 2 participants.');
+      return;
+    }
+
+    const grp: GroupChat = {
+      id: `grp-${Date.now()}`,
+      name: newGroupName.trim(),
+      description: `Discussion with ${selectedCharIds.length} personas`,
+      characterIds: selectedCharIds,
+      turnMode: 'auto-moderated',
+      createdAt: Date.now(),
+    };
+
+    await saveGroup(grp);
+    await loadData();
+    setActiveGroup(grp);
+    setShowCreateModal(false);
+    setNewGroupName('');
+  };
+
   return (
-    <div className="flex flex-col h-full bg-slate-50 dark:bg-slate-950 overflow-hidden">
-      {/* Top Header */}
-      <header className="h-14 px-4 flex items-center justify-between border-b border-slate-200/80 dark:border-slate-800/80 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md z-10 shrink-0">
-        <div className="flex items-center gap-2 min-w-0">
-          <div className="w-8 h-8 rounded-xl bg-indigo-100 dark:bg-indigo-950 flex items-center justify-center text-indigo-600 dark:text-indigo-400 shrink-0">
-            <Users className="w-4 h-4" />
-          </div>
-          <div className="min-w-0">
-            <div className="font-semibold text-sm text-slate-900 dark:text-white truncate">
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'android' ? undefined : 'padding'}
+    >
+      {/* Header */}
+      <View style={styles.header}>
+        <View style={styles.headerLeft}>
+          <Users size={20} color={theme.colors.emeraldText} />
+          <View>
+            <Text style={styles.headerTitle}>
               {activeGroup ? activeGroup.name : 'Group Discussions'}
-            </div>
-            <div className="text-[11px] text-slate-500 truncate">
-              {activeGroup
-                ? `${activeGroup.characterIds.length} Participants · Mode: ${activeGroup.turnMode}`
-                : 'Multi-character orchestration'}
-            </div>
-          </div>
-        </div>
+            </Text>
+            <Text style={styles.headerSubtitle}>
+              {activeGroup ? `${activeGroup.characterIds.length} Personas` : 'Select or create a room'}
+            </Text>
+          </View>
+        </View>
 
-        <button
-          type="button"
-          onClick={() => setShowCreateModal(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 transition-colors shadow-xs"
-        >
-          <Plus className="w-3.5 h-3.5" />
-          <span>New Group</span>
-        </button>
-      </header>
+        <Pressable style={styles.createBtn} onPress={() => setShowCreateModal(true)}>
+          <Plus size={14} color="#ffffff" />
+          <Text style={styles.createBtnText}>New Room</Text>
+        </Pressable>
+      </View>
 
-      {/* Main Group Content */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Groups Sidebar (Desktop/Tablet) */}
-        <div className="w-48 border-r border-slate-200 dark:border-slate-800 p-2 hidden sm:flex flex-col gap-1 overflow-y-auto bg-slate-50/50 dark:bg-slate-950">
-          <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider px-2 py-1">
-            Rooms ({groups.length})
-          </span>
-          {groups.map((g) => (
-            <button
-              key={g.id}
-              type="button"
-              onClick={() => setActiveGroup(g)}
-              className={`text-left px-3 py-2 rounded-xl text-xs font-medium truncate transition-colors ${
-                activeGroup?.id === g.id
-                  ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
-                  : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-900'
-              }`}
-            >
-              {g.name}
-            </button>
-          ))}
-        </div>
+      {/* Participants Avatar Bar */}
+      {activeGroup && (
+        <View style={styles.participantsBar}>
+          <Text style={styles.participantsLabel}>Turn:</Text>
+          {activeGroup.characterIds.map((cId) => {
+            const char = characters.find((c) => c.id === cId);
+            if (!char) return null;
+            const isSpeaking = currentSpeaker?.id === char.id;
 
-        {/* Conversation Area */}
-        <div className="flex-1 flex flex-col justify-between overflow-hidden">
-          {!activeGroup ? (
-            <div className="flex flex-col items-center justify-center h-full text-center p-6 text-slate-400">
-              <Users className="w-12 h-12 text-slate-300 dark:text-slate-700 mb-2" />
-              <p className="text-sm font-medium">No Group Selected</p>
-              <button
-                type="button"
-                onClick={() => setShowCreateModal(true)}
-                className="mt-3 px-4 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold"
+            return (
+              <Pressable
+                key={char.id}
+                style={[styles.charChip, isSpeaking && styles.charChipSpeaking]}
+                onPress={() => triggerNextTurn(`conv-group-${activeGroup.id}`, char.id)}
               >
-                Create Room
-              </button>
-            </div>
-          ) : (
-            <>
-              {/* Member Avatars Strip */}
-              <div className="px-4 py-2 bg-slate-100/70 dark:bg-slate-900/60 border-b border-slate-200/80 dark:border-slate-800/80 flex items-center justify-between gap-2 overflow-x-auto shrink-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium shrink-0">
-                    Participants:
-                  </span>
-                  {activeGroup.characterIds.map((cId) => {
-                    const c = db.getCharacterById(cId);
-                    if (!c) return null;
-                    const isSpeakingNow = currentSpeaker?.id === c.id;
-
-                    return (
-                      <button
-                        key={c.id}
-                        type="button"
-                        onClick={() => handleNextTurn(undefined, c.id)}
-                        disabled={isOrchestrating}
-                        title={`Click to prompt ${c.name} to speak`}
-                        className={`flex items-center gap-1.5 px-2 py-1 rounded-lg border text-xs transition-all ${
-                          isSpeakingNow
-                            ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/80 ring-2 ring-emerald-500/40 text-emerald-800 dark:text-emerald-300'
-                            : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:border-emerald-500/50'
-                        }`}
-                      >
-                        <img
-                          src={c.avatarUrl}
-                          alt={c.name}
-                          className="w-4 h-4 rounded-full object-cover"
-                          referrerPolicy="no-referrer"
-                        />
-                        <span className="font-medium text-[11px]">{c.name}</span>
-                        {isSpeakingNow && (
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" />
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {isOrchestrating && (
-                  <button
-                    type="button"
-                    onClick={handleStop}
-                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-red-500 text-white text-xs font-medium hover:bg-red-600 transition-colors"
-                  >
-                    <Square className="w-3 h-3 fill-white" />
-                    <span>Stop</span>
-                  </button>
-                )}
-              </div>
-
-              {/* Messages Feed */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                {messages.map((msg) => {
-                  const isUser = msg.senderType === 'user';
-                  return (
-                    <div
-                      key={msg.id}
-                      className={`flex gap-3 ${isUser ? 'justify-end' : 'justify-start'}`}
-                    >
-                      {!isUser && (
-                        <img
-                          src={
-                            msg.senderAvatar ||
-                            'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=256&h=256&q=80'
-                          }
-                          alt={msg.senderName}
-                          className="w-8 h-8 rounded-full object-cover shrink-0 mt-0.5 ring-1 ring-slate-200 dark:ring-slate-800"
-                          referrerPolicy="no-referrer"
-                        />
-                      )}
-                      <div
-                        className={`max-w-[85%] rounded-2xl px-4 py-3 shadow-xs ${
-                          isUser
-                            ? 'bg-emerald-600 text-white rounded-br-xs'
-                            : 'bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800/80 rounded-bl-xs'
-                        }`}
-                      >
-                        {!isUser && (
-                          <div className="font-semibold text-xs text-slate-900 dark:text-white mb-1">
-                            {msg.senderName}
-                          </div>
-                        )}
-                        <RichResponseRenderer content={msg.content} />
-                      </div>
-                    </div>
-                  );
-                })}
-
-                {currentSpeaker && (
-                  <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 animate-pulse pl-2">
-                    <img
-                      src={currentSpeaker.avatarUrl}
-                      alt={currentSpeaker.name}
-                      className="w-5 h-5 rounded-full object-cover"
-                      referrerPolicy="no-referrer"
-                    />
-                    <span>{currentSpeaker.name} is responding to the room...</span>
-                  </div>
-                )}
-                <div ref={messagesEndRef} />
-              </div>
-
-              {/* Group Chat Input */}
-              <div className="p-3 bg-white dark:bg-slate-900 border-t border-slate-200/80 dark:border-slate-800/80 shrink-0">
-                <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 rounded-2xl p-1.5 border border-slate-200 dark:border-slate-700">
-                  <input
-                    type="text"
-                    value={inputText}
-                    onChange={(e) => setInputText(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleSendUserMessage()}
-                    placeholder="Speak to the group or mention @Name..."
-                    className="flex-1 bg-transparent border-0 px-3 py-1.5 text-sm text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleSendUserMessage}
-                    disabled={!inputText.trim() || isOrchestrating}
-                    className="w-9 h-9 rounded-xl bg-emerald-600 text-white flex items-center justify-center hover:bg-emerald-700 disabled:opacity-40 transition-colors shrink-0"
-                  >
-                    <Send className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
-            </>
+                <PersonaAvatar name={char.name} avatarKey={char.avatarKey} size={22} />
+                <Text style={styles.charChipName}>{char.name}</Text>
+                {isSpeaking && <View style={styles.speakingDot} />}
+              </Pressable>
+            );
+          })}
+          {isOrchestrating && (
+            <Pressable style={styles.stopBtn} onPress={handleStop}>
+              <Square size={12} color="#ffffff" fill="#ffffff" />
+            </Pressable>
           )}
-        </div>
-      </div>
+        </View>
+      )}
+
+      {/* Messages */}
+      <FlatList
+        ref={flatListRef}
+        data={messages}
+        keyExtractor={(item) => item.id}
+        contentContainerStyle={styles.list}
+        onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
+        renderItem={({ item }) => {
+          const isUser = item.senderType === 'user';
+          return (
+            <View style={[styles.msgRow, isUser ? styles.userRow : styles.assistantRow]}>
+              {!isUser && (
+                <PersonaAvatar name={item.senderName} avatarKey={item.senderAvatar} size={28} />
+              )}
+              <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
+                {!isUser && <Text style={styles.senderLabel}>{item.senderName}</Text>}
+                {isUser ? (
+                  <Text style={styles.userContent}>{item.content}</Text>
+                ) : (
+                  <RichResponseRenderer content={item.content} />
+                )}
+              </View>
+            </View>
+          );
+        }}
+        ListEmptyComponent={
+          <View style={styles.emptyContainer}>
+            <Text style={styles.emptyTitle}>
+              {activeGroup ? 'No messages yet' : 'Create or select a room to begin'}
+            </Text>
+            <Text style={styles.emptySubtitle}>
+              Participants will respond according to their system prompts and personalities.
+            </Text>
+          </View>
+        }
+      />
+
+      {/* Input */}
+      {activeGroup && (
+        <View style={styles.inputBar}>
+          <TextInput
+            style={styles.input}
+            value={inputText}
+            onChangeText={setInputText}
+            placeholder="Address the room or mention a persona..."
+            placeholderTextColor="#64748b"
+          />
+          <Pressable
+            style={[styles.sendBtn, !inputText.trim() && styles.sendBtnDisabled]}
+            disabled={!inputText.trim() || isOrchestrating}
+            onPress={handleSend}
+          >
+            <Send size={16} color="#ffffff" />
+          </Pressable>
+        </View>
+      )}
 
       {/* Create Room Modal */}
       {showCreateModal && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl max-w-md w-full p-5 shadow-2xl space-y-4">
-            <h3 className="font-bold text-base text-slate-900 dark:text-white">
-              Create Multi-Character Discussion
-            </h3>
+        <Modal visible transparent animationType="slide" onRequestClose={() => setShowCreateModal(false)}>
+          <View style={styles.modalBackdrop}>
+            <View style={styles.modalCard}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Create Discussion Room</Text>
+                <Pressable onPress={() => setShowCreateModal(false)}>
+                  <X size={20} color="#94a3b8" />
+                </Pressable>
+              </View>
 
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Room Topic / Name
-                </label>
-                <input
-                  type="text"
-                  value={newGroupName}
-                  onChange={(e) => setNewGroupName(e.target.value)}
-                  placeholder="e.g. Systems Architecture Roundtable"
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white"
-                />
-              </div>
+              <Text style={styles.label}>Room Name</Text>
+              <TextInput
+                style={styles.modalInput}
+                value={newGroupName}
+                onChangeText={setNewGroupName}
+                placeholder="e.g. Systems Architecture Roundtable"
+                placeholderTextColor="#64748b"
+              />
 
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Select Participating Personas (min 2)
-                </label>
-                <div className="space-y-1.5 max-h-40 overflow-y-auto">
-                  {allCharacters.map((c) => {
-                    const isChecked = selectedCharIds.includes(c.id);
-                    return (
-                      <label
-                        key={c.id}
-                        className={`flex items-center gap-2 p-2 rounded-xl border text-xs cursor-pointer ${
-                          isChecked
-                            ? 'border-emerald-500 bg-emerald-50/50 dark:bg-emerald-950/40 text-slate-900 dark:text-white'
-                            : 'border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400'
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={isChecked}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              setSelectedCharIds([...selectedCharIds, c.id]);
-                            } else {
-                              setSelectedCharIds(selectedCharIds.filter((id) => id !== c.id));
-                            }
-                          }}
-                          className="rounded text-emerald-600 focus:ring-emerald-500"
-                        />
-                        <img
-                          src={c.avatarUrl}
-                          alt={c.name}
-                          className="w-5 h-5 rounded-full object-cover"
-                          referrerPolicy="no-referrer"
-                        />
-                        <span className="font-medium">{c.name}</span>
-                        <span className="text-[10px] text-slate-400 truncate">({c.tagline})</span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
+              <Text style={styles.label}>Select Participants (min 2)</Text>
+              <View style={styles.charPicker}>
+                {characters.map((c) => {
+                  const selected = selectedCharIds.includes(c.id);
+                  return (
+                    <Pressable
+                      key={c.id}
+                      style={[styles.pickerItem, selected && styles.pickerItemSelected]}
+                      onPress={() => {
+                        if (selected) {
+                          setSelectedCharIds(selectedCharIds.filter((id) => id !== c.id));
+                        } else {
+                          setSelectedCharIds([...selectedCharIds, c.id]);
+                        }
+                      }}
+                    >
+                      <PersonaAvatar name={c.name} avatarKey={c.avatarKey} size={28} />
+                      <Text style={styles.pickerText}>{c.name}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
 
-              <div>
-                <label className="font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Turn-Taking Mode
-                </label>
-                <select
-                  value={turnMode}
-                  onChange={(e) => setTurnMode(e.target.value as any)}
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white"
-                >
-                  <option value="auto-moderated">Auto-Moderated (Based on topic context)</option>
-                  <option value="round-robin">Round-Robin (Fixed rotation)</option>
-                  <option value="manual-mention">Manual Mention (Triggered via @Name)</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
-              <button
-                type="button"
-                onClick={() => setShowCreateModal(false)}
-                className="px-4 py-2 rounded-xl text-slate-600 dark:text-slate-400 text-xs font-medium"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleCreateGroup}
-                disabled={!newGroupName.trim() || selectedCharIds.length < 2}
-                className="px-5 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold disabled:opacity-40"
-              >
-                Create Room
-              </button>
-            </div>
-          </div>
-        </div>
+              <View style={styles.modalActions}>
+                <Pressable style={styles.cancelBtn} onPress={() => setShowCreateModal(false)}>
+                  <Text style={styles.cancelBtnText}>Cancel</Text>
+                </Pressable>
+                <Pressable style={styles.confirmBtn} onPress={handleCreateGroup}>
+                  <Text style={styles.confirmBtnText}>Create</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
       )}
-    </div>
+    </KeyboardAvoidingView>
   );
 };
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: theme.colors.bgCanvas,
+  },
+  header: {
+    height: 56,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    backgroundColor: theme.colors.bgSurface,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+  },
+  headerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  headerTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+  },
+  headerSubtitle: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+  },
+  createBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: theme.colors.emerald,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  createBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#ffffff',
+  },
+  participantsBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#0a101f',
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+    gap: 8,
+  },
+  participantsLabel: {
+    fontSize: 11,
+    color: '#64748b',
+    fontWeight: '600',
+  },
+  charChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: theme.colors.bgCard,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  charChipSpeaking: {
+    borderColor: theme.colors.emerald,
+    backgroundColor: 'rgba(16, 185, 129, 0.12)',
+  },
+  charChipName: {
+    fontSize: 11.5,
+    color: theme.colors.textPrimary,
+    fontWeight: '600',
+  },
+  speakingDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: theme.colors.emerald,
+  },
+  stopBtn: {
+    backgroundColor: theme.colors.red,
+    padding: 6,
+    borderRadius: 6,
+    marginLeft: 'auto',
+  },
+  list: {
+    padding: 16,
+    gap: 12,
+  },
+  msgRow: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'flex-start',
+  },
+  userRow: {
+    justifyContent: 'flex-end',
+  },
+  assistantRow: {
+    justifyContent: 'flex-start',
+  },
+  bubble: {
+    maxWidth: '82%',
+    borderRadius: 14,
+    padding: 12,
+  },
+  userBubble: {
+    backgroundColor: theme.colors.emeraldDark,
+    borderBottomRightRadius: 4,
+  },
+  assistantBubble: {
+    backgroundColor: theme.colors.bgSurface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderBottomLeftRadius: 4,
+  },
+  senderLabel: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: theme.colors.emeraldText,
+    marginBottom: 4,
+  },
+  userContent: {
+    fontSize: 14,
+    color: '#ffffff',
+    lineHeight: 20,
+  },
+  emptyContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 80,
+    paddingHorizontal: 32,
+    gap: 6,
+  },
+  emptyTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+  },
+  emptySubtitle: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    textAlign: 'center',
+  },
+  inputBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 10,
+    backgroundColor: theme.colors.bgSurface,
+    borderTopWidth: 1,
+    borderTopColor: theme.colors.border,
+    gap: 8,
+  },
+  input: {
+    flex: 1,
+    backgroundColor: theme.colors.bgInput,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 13.5,
+    color: theme.colors.textPrimary,
+  },
+  sendBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: theme.colors.emerald,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sendBtnDisabled: {
+    opacity: 0.35,
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalCard: {
+    backgroundColor: theme.colors.bgSurface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: 18,
+    gap: 10,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  modalTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+  },
+  label: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: theme.colors.textSecondary,
+    marginTop: 6,
+  },
+  modalInput: {
+    backgroundColor: theme.colors.bgInput,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 13,
+    color: theme.colors.textPrimary,
+  },
+  charPicker: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginVertical: 4,
+  },
+  pickerItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: theme.colors.bgCard,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  pickerItemSelected: {
+    borderColor: theme.colors.emerald,
+    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+  },
+  pickerText: {
+    fontSize: 12,
+    color: theme.colors.textPrimary,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 10,
+  },
+  cancelBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  cancelBtnText: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+  },
+  confirmBtn: {
+    backgroundColor: theme.colors.emerald,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  confirmBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#ffffff',
+  },
+});
