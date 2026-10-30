@@ -105,7 +105,6 @@ if [ "$ENGINE" = "llama.cpp" ]; then
         --port "$PORT" \\
         -c 4096 \\
         -t 4 \\
-        --embedding \\
         --slots
 elif [ "$ENGINE" = "prism-ml" ]; then
     echo "[CloverPal] Launching Prism ML Server on port $PORT..."
@@ -114,6 +113,9 @@ elif [ "$ENGINE" = "prism-ml" ]; then
         --port "$PORT" \\
         --model-dir "$MODELS_DIR" \\
         --threads 4
+else
+    echo "[ERROR] Unknown engine: $ENGINE"
+    exit 1
 fi
 `;
 }
