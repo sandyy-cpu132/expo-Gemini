@@ -1,8 +1,12 @@
 /**
  * llama.cpp HTTP Server Adapter
  * Connects to llama.cpp server running on Termux loopback (default: http://127.0.0.1:8080).
+ *
+ * Streaming uses expo/fetch because React Native's global fetch does not expose a
+ * readable response body. The global fetch is still used for non-streaming calls.
  */
 
+import { fetch as expoFetch } from 'expo/fetch';
 import {
   ChatMessage,
   EngineCapabilities,
@@ -166,7 +170,8 @@ export class LlamaCppAdapter implements InferenceEngine {
     let tokenCount = 0;
 
     try {
-      const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+      // expo/fetch provides a streaming response body on React Native.
+      const response = await expoFetch(`${this.baseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -182,16 +187,16 @@ export class LlamaCppAdapter implements InferenceEngine {
       }
 
       if (!response.body) {
-        // Fallback for non-streaming environments: read json
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content || '';
-        onChunk({ token: content, isFinished: true });
-        return;
+        throw new Error(
+          'Streaming is not supported by this runtime (response has no body). Check the expo/fetch setup.'
+        );
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
       let buffer = '';
+
+      const estimatedPromptTokens = Math.ceil(JSON.stringify(messages).length / 4);
 
       while (true) {
         const { done, value } = await reader.read();
@@ -210,9 +215,9 @@ export class LlamaCppAdapter implements InferenceEngine {
             const evalMs = totalMs - promptTime;
             const tps = tokenCount > 0 && evalMs > 0 ? (tokenCount / evalMs) * 1000 : 0;
             const stats: GenerationStats = {
-              promptTokens: Math.ceil(JSON.stringify(messages).length / 4),
+              promptTokens: estimatedPromptTokens,
               completionTokens: tokenCount,
-              totalTokens: Math.ceil(JSON.stringify(messages).length / 4) + tokenCount,
+              totalTokens: estimatedPromptTokens + tokenCount,
               promptMs: Math.round(promptTime),
               evalMs: Math.round(evalMs),
               tokensPerSecond: Math.round(tps * 10) / 10,
@@ -235,7 +240,7 @@ export class LlamaCppAdapter implements InferenceEngine {
                 onChunk({ token: delta, isFinished: false });
               }
 
-              // Extract real timings if server provided them
+              // Prefer real server timings when the server provides them
               if (json.timings) {
                 const timings = json.timings;
                 this.lastStats = {
@@ -256,7 +261,7 @@ export class LlamaCppAdapter implements InferenceEngine {
                   promptMs: Math.round(promptTime),
                   evalMs: Math.round(totalMs - promptTime),
                   tokensPerSecond:
-                    tokenCount > 0 && totalMs > 0 ? Math.round(((tokenCount / totalMs) * 1000) * 10) / 10 : 0,
+                    tokenCount > 0 && totalMs > 0 ? Math.round((tokenCount / totalMs) * 1000 * 10) / 10 : 0,
                   isEstimated: false,
                 };
               }
@@ -297,4 +302,4 @@ export class LlamaCppAdapter implements InferenceEngine {
       status: this.currentStatus,
     };
   }
-}
+          }
