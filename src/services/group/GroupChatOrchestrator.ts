@@ -1,7 +1,8 @@
 /**
  * GroupChatOrchestrator
- * Coordinates multi-character group conversations with turn taking,
- * loop prevention, and shared context.
+ * Runs one persona turn at a time in a group room. The inference engine is a single
+ * shared stream, so a second turn is refused while one is running. A stopped turn is
+ * saved with status "interrupted" instead of being saved as if it completed.
  */
 
 import { CharacterCard, ChatMessage, GroupChat, Message } from '../../types';
@@ -10,23 +11,33 @@ import { runtimeManager } from '../runtime/RuntimeConnectionManager';
 
 export interface GroupTurnEvent {
   character: CharacterCard;
-  status: 'thinking' | 'speaking' | 'completed' | 'skipped';
+  status: 'thinking' | 'completed' | 'interrupted' | 'error';
   message?: Message;
+  error?: string;
 }
 
-export class GroupChatOrchestrator {
-  private isOrchestrating = false;
-  private currentTurnIndex = 0;
-  private loopGuardCounter = 0;
-  private maxConsecutiveCharacterTurns = 3;
+const HISTORY_TURNS = 8;
+const MAX_AUTO_TURNS_IN_A_ROW = 3;
 
-  public stopOrchestration() {
-    this.isOrchestrating = false;
+export class GroupChatOrchestrator {
+  private busy = false;
+  private stopRequested = false;
+  private roundRobinIndex = 0;
+  private autoTurnsInARow = 0;
+
+  public isBusy(): boolean {
+    return this.busy;
+  }
+
+  public stopOrchestration(): void {
+    if (!this.busy) return;
+    this.stopRequested = true;
     runtimeManager.getActiveEngine().stopGeneration();
   }
 
-  public isBusy(): boolean {
-    return this.isOrchestrating;
+  /** Call when the user sends a message so automatic turns can run again. */
+  public resetLoopGuard(): void {
+    this.autoTurnsInARow = 0;
   }
 
   public selectNextSpeaker(
@@ -37,132 +48,135 @@ export class GroupChatOrchestrator {
     if (characters.length === 0) return null;
 
     if (group.turnMode === 'round-robin') {
-      const char = characters[this.currentTurnIndex % characters.length];
-      this.currentTurnIndex++;
-      return char;
+      const next = characters[this.roundRobinIndex % characters.length];
+      this.roundRobinIndex++;
+      return next;
     }
 
     if (group.turnMode === 'manual-mention') {
-      const lastUserMsg = [...recentMessages].reverse().find((m) => m.senderType === 'user');
-      if (lastUserMsg) {
-        for (const c of characters) {
-          if (lastUserMsg.content.toLowerCase().includes(`@${c.name.toLowerCase()}`)) {
-            return c;
-          }
-        }
+      const lastUser = [...recentMessages].reverse().find((m) => m.senderType === 'user');
+      if (lastUser) {
+        const lower = lastUser.content.toLowerCase();
+        const mentioned = characters.find((c) => lower.includes(`@${c.name.toLowerCase()}`));
+        if (mentioned) return mentioned;
       }
       return characters[0];
     }
 
-    // Auto-moderated
-    const lastSpeakerId = recentMessages[recentMessages.length - 1]?.senderId;
-    const candidates = characters.filter((c) => c.id !== lastSpeakerId);
-    return candidates.length > 0
-      ? candidates[Math.floor(Math.random() * candidates.length)]
-      : characters[0];
+    // auto-moderated: avoid repeating the most recent persona when possible
+    const lastAssistant = [...recentMessages].reverse().find((m) => m.senderType === 'assistant');
+    const candidates = characters.filter((c) => c.id !== lastAssistant?.senderId);
+    const pool = candidates.length > 0 ? candidates : characters;
+    return pool[Math.floor(Math.random() * pool.length)];
   }
 
+  /**
+   * Runs one turn. Pass forcedCharacterId when the user taps a persona chip.
+   * Returns the saved message, or null if nothing was saved.
+   */
   public async executeGroupTurn(
     conversationId: string,
     group: GroupChat,
     onTurnUpdate: (event: GroupTurnEvent) => void,
-    specificCharacterId?: string
+    forcedCharacterId?: string
   ): Promise<Message | null> {
-    const allChars = await getCharacters();
-    const groupCharacters = group.characterIds
-      .map((id) => allChars.find((c) => c.id === id))
+    if (this.busy) return null;
+
+    const allCharacters = await getCharacters();
+    const members = group.characterIds
+      .map((id) => allCharacters.find((c) => c.id === id))
       .filter((c): c is CharacterCard => !!c);
 
-    if (groupCharacters.length === 0) return null;
+    if (members.length === 0) return null;
 
-    let targetCharacter: CharacterCard | null = null;
-    if (specificCharacterId) {
-      targetCharacter = groupCharacters.find((c) => c.id === specificCharacterId) || null;
+    const history = await getMessages(conversationId);
+
+    let target: CharacterCard | null = null;
+    if (forcedCharacterId) {
+      target = members.find((c) => c.id === forcedCharacterId) ?? null;
     }
 
-    const messages = await getMessages(conversationId);
-    if (!targetCharacter) {
-      targetCharacter = this.selectNextSpeaker(group, messages, groupCharacters);
+    if (!target) {
+      if (this.autoTurnsInARow >= MAX_AUTO_TURNS_IN_A_ROW) {
+        // Loop guard: stop automatic turns until the user speaks or taps a persona.
+        return null;
+      }
+      target = this.selectNextSpeaker(group, history, members);
+      this.autoTurnsInARow++;
     }
 
-    if (!targetCharacter) return null;
+    if (!target) return null;
 
-    if (this.loopGuardCounter >= this.maxConsecutiveCharacterTurns) {
-      this.loopGuardCounter = 0;
-      return null;
-    }
+    this.busy = true;
+    this.stopRequested = false;
+    onTurnUpdate({ character: target, status: 'thinking' });
 
-    this.isOrchestrating = true;
-    this.loopGuardCounter++;
-
-    onTurnUpdate({
-      character: targetCharacter,
-      status: 'thinking',
-    });
-
-    const recentTurns: ChatMessage[] = messages.slice(-5).map((m) => ({
+    const recentTurns: ChatMessage[] = history.slice(-HISTORY_TURNS).map((m) => ({
       role: m.senderType === 'user' ? 'user' : 'assistant',
       content: `${m.senderName}: ${m.content}`,
     }));
 
-    const groupSystemPrompt = `You are ${targetCharacter.name} in a collaborative room called "${group.name}".
-Personality: ${targetCharacter.personality}
-System Prompt: ${targetCharacter.systemPrompt}
-Other personas present: ${groupCharacters.map((c) => c.name).join(', ')}.
-Respond as ${targetCharacter.name}. Keep it conversational and concise. Do not speak for others.`;
+    const systemPrompt = `You are ${target.name} in a collaborative room called "${group.name}".
+Personality: ${target.personality}
+System Prompt: ${target.systemPrompt}
+Other personas present: ${members.map((c) => c.name).join(', ')}.
+Respond as ${target.name}. Keep it conversational and concise. Do not speak for others.`;
 
     const chatInput: ChatMessage[] = [
-      { role: 'system', content: groupSystemPrompt },
+      { role: 'system', content: systemPrompt },
       ...recentTurns,
-      { role: 'user', content: `Please provide your perspective, ${targetCharacter.name}.` },
+      { role: 'user', content: `Please provide your perspective, ${target.name}.` },
     ];
 
-    try {
-      const engine = runtimeManager.getActiveEngine();
-      let responseText = '';
+    let responseText = '';
 
-      await engine.streamGenerate(
+    try {
+      await runtimeManager.getActiveEngine().streamGenerate(
         chatInput,
-        { temperature: 0.8, maxTokens: 400 },
+        undefined,
         (chunk) => {
           responseText += chunk.token;
         }
       );
 
-      const msg: Message = {
-        id: `msg-grp-${Date.now()}`,
+      const interrupted = this.stopRequested;
+      const content = responseText.trim();
+
+      if (interrupted && !content) {
+        onTurnUpdate({ character: target, status: 'interrupted' });
+        return null;
+      }
+
+      const message: Message = {
+        id: `msg-grp-${Date.now()}-${target.id}`,
         conversationId,
         senderType: 'assistant',
-        senderId: targetCharacter.id,
-        senderName: targetCharacter.name,
-        senderAvatar: targetCharacter.avatarKey,
-        content: responseText.trim(),
+        senderId: target.id,
+        senderName: target.name,
+        senderAvatar: target.avatarKey,
+        content,
+        status: interrupted ? 'interrupted' : 'complete',
         createdAt: Date.now(),
-        status: 'complete',
       };
 
-      await saveMessage(msg);
-
+      await saveMessage(message);
       onTurnUpdate({
-        character: targetCharacter,
-        status: 'completed',
-        message: msg,
+        character: target,
+        status: interrupted ? 'interrupted' : 'completed',
+        message,
       });
-
-      return msg;
-    } catch {
+      return message;
+    } catch (err: any) {
       onTurnUpdate({
-        character: targetCharacter,
-        status: 'skipped',
+        character: target,
+        status: 'error',
+        error: err?.message || 'Generation failed',
       });
       return null;
     } finally {
-      this.isOrchestrating = false;
+      this.busy = false;
+      this.stopRequested = false;
     }
-  }
-
-  public resetLoopGuard() {
-    this.loopGuardCounter = 0;
   }
 }
 
