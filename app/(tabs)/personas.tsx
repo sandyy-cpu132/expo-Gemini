@@ -11,10 +11,10 @@ export default function PersonasTab() {
 
   const handleStartChat = async (char: CharacterCard) => {
     const existing = await getConversations();
-    let target = existing.find((c) => c.characterId === char.id);
+    let target = existing.find((c) => c.characterId === char.id && !c.groupId);
 
     if (!target) {
-      target = {
+      const created: Conversation = {
         id: `conv-${char.id}-${Date.now()}`,
         title: `Chat with ${char.name}`,
         characterId: char.id,
@@ -23,10 +23,12 @@ export default function PersonasTab() {
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
-      await saveConversation(target);
+      await saveConversation(created);
+      target = created;
     }
 
-    router.replace('/(tabs)');
+    // Pass the exact conversation ID so the Chats tab opens this persona's chat.
+    router.navigate({ pathname: '/', params: { conversationId: target.id } });
   };
 
   return (
