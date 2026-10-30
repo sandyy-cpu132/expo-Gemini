@@ -1,6 +1,10 @@
 /**
  * Asynchronous SQLite Repository for CloverPal Offline AI
- * Uses expo-sqlite with PRAGMA foreign_keys, migrations, transactions, and parameterized SQL.
+ * expo-sqlite with PRAGMA foreign_keys, versioned migrations, and parameterized SQL.
+ *
+ * Writes use INSERT ... ON CONFLICT DO UPDATE (upsert), not INSERT OR REPLACE.
+ * REPLACE deletes the old row first, which fires ON DELETE CASCADE / SET NULL on child
+ * rows. Without this, editing a persona would remove it from every group room.
  */
 
 import React, { createContext, useContext, useEffect, useState } from 'react';
@@ -19,7 +23,11 @@ import {
 } from '../../types';
 import { MIGRATION_1_STATEMENTS, MIGRATION_2_STATEMENTS } from './schema';
 
-let dbInstance: SQLite.SQLiteDatabase | null = null;
+type Db = SQLite.SQLiteDatabase;
+
+const BACKUP_SCHEMA_VERSION = 2;
+const MAX_BACKUP_CHARS = 50 * 1024 * 1024;
+const GROUP_MODEL_PLACEHOLDER = 'active-engine';
 
 const SEED_CHARACTERS: CharacterCard[] = [
   {
@@ -84,72 +92,62 @@ const SEED_CHARACTERS: CharacterCard[] = [
   },
 ];
 
-export async function getDatabase(): Promise<SQLite.SQLiteDatabase> {
-  if (dbInstance) return dbInstance;
+// ==========================================
+// Open, migrate, seed
+// ==========================================
 
+async function openAndMigrate(): Promise<Db> {
   const db = await SQLite.openDatabaseAsync('cloverpal.db');
   await db.execAsync('PRAGMA foreign_keys = ON;');
 
-  // Check version and run migrations
   const versionRow = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
-  const currentVersion = versionRow?.user_version ?? 0;
+  const version = versionRow?.user_version ?? 0;
 
-  if (currentVersion < 1) {
+  if (version < 1) {
     for (const stmt of MIGRATION_1_STATEMENTS) {
       await db.execAsync(stmt);
     }
     await db.execAsync('PRAGMA user_version = 1;');
   }
 
-  if (currentVersion < 2) {
+  if (version < 2) {
     for (const stmt of MIGRATION_2_STATEMENTS) {
       try {
         await db.execAsync(stmt);
       } catch {
-        // Column may already exist if partially applied
+        // Column already exists from a partially applied migration
       }
     }
     await db.execAsync('PRAGMA user_version = 2;');
   }
 
-  // Seed default characters if empty
-  const countRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM characters;');
+  if (version < 3) {
+    // Rooms saved before this version had no conversation row, so message saves
+    // failed the foreign key check. Create the missing rows once.
+    await db.runAsync(
+      `INSERT OR IGNORE INTO conversations (id, title, character_id, group_id, engine, model_id, created_at, updated_at)
+       SELECT 'conv-group-' || id, name, NULL, id, 'llama.cpp', ?, created_at, created_at FROM "groups";`,
+      [GROUP_MODEL_PLACEHOLDER]
+    );
+    await db.execAsync('PRAGMA user_version = 3;');
+  }
+
+  const countRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) AS count FROM characters;');
   if ((countRow?.count ?? 0) === 0) {
     for (const c of SEED_CHARACTERS) {
-      await db.runAsync(
-        `INSERT INTO characters (id, name, tagline, description, avatar_key, personality, system_prompt, greeting_message, example_dialogue, category, response_mode, memory_scope, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
-        [
-          c.id,
-          c.name,
-          c.tagline,
-          c.description,
-          c.avatarKey,
-          c.personality,
-          c.systemPrompt,
-          c.greetingMessage,
-          c.exampleDialogue,
-          c.category,
-          c.responseMode,
-          c.memoryScope,
-          c.createdAt,
-        ]
-      );
+      await upsertCharacter(db, c);
     }
 
-    // Default collection
     await db.runAsync(
       `INSERT OR IGNORE INTO document_collections (id, name, description, color, created_at)
        VALUES (?, ?, ?, ?, ?);`,
       ['coll-default', 'General Knowledge', 'Core local reference documents', '#10b981', Date.now()]
     );
 
-    // Initial conversation with Clover
-    const convId = 'conv-welcome';
     await db.runAsync(
       `INSERT OR IGNORE INTO conversations (id, title, character_id, engine, model_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?);`,
-      [convId, 'Welcome to CloverPal', 'char-clover', 'llama.cpp', 'llama-3.2-3b', Date.now(), Date.now()]
+      ['conv-welcome', 'Welcome to CloverPal', 'char-clover', 'llama.cpp', 'llama-3.2-3b', Date.now(), Date.now()]
     );
 
     await db.runAsync(
@@ -157,7 +155,7 @@ export async function getDatabase(): Promise<SQLite.SQLiteDatabase> {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
       [
         'msg-welcome',
-        convId,
+        'conv-welcome',
         'assistant',
         'char-clover',
         'Clover',
@@ -168,58 +166,74 @@ export async function getDatabase(): Promise<SQLite.SQLiteDatabase> {
     );
   }
 
-  dbInstance = db;
   return db;
 }
 
-// ==========================================
-// Repository Methods
-// ==========================================
+let dbPromise: Promise<Db> | null = null;
 
-export async function getConversations(): Promise<Conversation[]> {
-  const db = await getDatabase();
-  const rows = await db.getAllAsync<any>(
-    'SELECT * FROM conversations ORDER BY updated_at DESC;'
-  );
-  return rows.map((r) => ({
-    id: r.id,
-    title: r.title,
-    characterId: r.character_id,
-    groupId: r.group_id,
-    engine: r.engine,
-    modelId: r.model_id,
-    systemPromptOverride: r.system_prompt_override,
-    summary: r.summary,
-    activeCollectionIds: r.active_collection_ids ? JSON.parse(r.active_collection_ids) : undefined,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
-  }));
+/** Opens the database once. Concurrent callers share the same promise. */
+export function getDatabase(): Promise<Db> {
+  if (!dbPromise) {
+    dbPromise = openAndMigrate().catch((err) => {
+      dbPromise = null; // allow a retry after a failed open
+      throw err;
+    });
+  }
+  return dbPromise;
 }
 
-export async function getConversation(id: string): Promise<Conversation | null> {
-  const db = await getDatabase();
-  const r = await db.getFirstAsync<any>('SELECT * FROM conversations WHERE id = ?;', [id]);
-  if (!r) return null;
-  return {
-    id: r.id,
-    title: r.title,
-    characterId: r.character_id,
-    groupId: r.group_id,
-    engine: r.engine,
-    modelId: r.model_id,
-    systemPromptOverride: r.system_prompt_override,
-    summary: r.summary,
-    activeCollectionIds: r.active_collection_ids ? JSON.parse(r.active_collection_ids) : undefined,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
-  };
-}
+// ==========================================
+// Row writers (take the db handle so they can run inside transactions)
+// ==========================================
 
-export async function saveConversation(conv: Conversation): Promise<void> {
-  const db = await getDatabase();
+async function upsertCharacter(db: Db, c: CharacterCard): Promise<void> {
   await db.runAsync(
-    `INSERT OR REPLACE INTO conversations (id, title, character_id, group_id, engine, model_id, system_prompt_override, summary, active_collection_ids, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+    `INSERT INTO characters (id, name, tagline, description, avatar_key, personality, system_prompt, greeting_message, example_dialogue, category, response_mode, memory_scope, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name,
+       tagline = excluded.tagline,
+       description = excluded.description,
+       avatar_key = excluded.avatar_key,
+       personality = excluded.personality,
+       system_prompt = excluded.system_prompt,
+       greeting_message = excluded.greeting_message,
+       example_dialogue = excluded.example_dialogue,
+       category = excluded.category,
+       response_mode = excluded.response_mode,
+       memory_scope = excluded.memory_scope;`,
+    [
+      c.id,
+      c.name,
+      c.tagline,
+      c.description,
+      c.avatarKey,
+      c.personality,
+      c.systemPrompt,
+      c.greetingMessage,
+      c.exampleDialogue,
+      c.category,
+      c.responseMode,
+      c.memoryScope,
+      c.createdAt,
+    ]
+  );
+}
+
+async function upsertConversation(db: Db, conv: Conversation): Promise<void> {
+  await db.runAsync(
+    `INSERT INTO conversations (id, title, character_id, group_id, engine, model_id, system_prompt_override, summary, active_collection_ids, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       title = excluded.title,
+       character_id = excluded.character_id,
+       group_id = excluded.group_id,
+       engine = excluded.engine,
+       model_id = excluded.model_id,
+       system_prompt_override = excluded.system_prompt_override,
+       summary = excluded.summary,
+       active_collection_ids = excluded.active_collection_ids,
+       updated_at = excluded.updated_at;`,
     [
       conv.id,
       conv.title,
@@ -236,48 +250,45 @@ export async function saveConversation(conv: Conversation): Promise<void> {
   );
 }
 
-export async function deleteConversation(id: string): Promise<void> {
-  const db = await getDatabase();
-  await db.runAsync('DELETE FROM conversations WHERE id = ?;', [id]);
-}
-
-export async function getMessages(conversationId: string): Promise<Message[]> {
-  const db = await getDatabase();
-  const rows = await db.getAllAsync<any>(
-    'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC;',
-    [conversationId]
-  );
-  return rows.map((r) => ({
-    id: r.id,
-    conversationId: r.conversation_id,
-    senderType: r.sender_type,
-    senderId: r.sender_id,
-    senderName: r.sender_name,
-    senderAvatar: r.sender_avatar,
-    content: r.content,
-    formatMode: r.format_mode,
-    citations: r.citations_json ? JSON.parse(r.citations_json) : undefined,
-    stats:
-      r.tokens_per_second || r.prompt_tokens
-        ? {
-            promptTokens: r.prompt_tokens,
-            completionTokens: r.completion_tokens,
-            totalTokens: r.prompt_tokens + r.completion_tokens,
-            promptMs: 0,
-            evalMs: r.eval_ms,
-            tokensPerSecond: r.tokens_per_second,
-          }
-        : undefined,
-    status: r.status || 'complete',
-    createdAt: r.created_at,
-  }));
-}
-
-export async function saveMessage(msg: Message): Promise<void> {
-  const db = await getDatabase();
+async function upsertGroupRow(db: Db, group: GroupChat): Promise<void> {
   await db.runAsync(
-    `INSERT OR REPLACE INTO messages (id, conversation_id, sender_type, sender_id, sender_name, sender_avatar, content, format_mode, citations_json, prompt_tokens, completion_tokens, tokens_per_second, eval_ms, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+    `INSERT INTO "groups" (id, name, description, turn_mode, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name,
+       description = excluded.description,
+       turn_mode = excluded.turn_mode;`,
+    [group.id, group.name, group.description, group.turnMode, group.createdAt]
+  );
+}
+
+/** Every room needs a conversation row so its messages have a valid parent. */
+async function upsertRoomConversation(db: Db, group: GroupChat): Promise<void> {
+  await upsertConversation(db, {
+    id: `conv-group-${group.id}`,
+    title: group.name,
+    characterId: undefined,
+    groupId: group.id,
+    engine: 'llama.cpp',
+    modelId: GROUP_MODEL_PLACEHOLDER,
+    createdAt: group.createdAt,
+    updatedAt: Date.now(),
+  });
+}
+
+async function upsertMessage(db: Db, msg: Message): Promise<void> {
+  await db.runAsync(
+    `INSERT INTO messages (id, conversation_id, sender_type, sender_id, sender_name, sender_avatar, content, format_mode, citations_json, prompt_tokens, completion_tokens, tokens_per_second, eval_ms, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       content = excluded.content,
+       status = excluded.status,
+       citations_json = excluded.citations_json,
+       format_mode = excluded.format_mode,
+       prompt_tokens = excluded.prompt_tokens,
+       completion_tokens = excluded.completion_tokens,
+       tokens_per_second = excluded.tokens_per_second,
+       eval_ms = excluded.eval_ms;`,
     [
       msg.id,
       msg.conversationId,
@@ -296,36 +307,120 @@ export async function saveMessage(msg: Message): Promise<void> {
       msg.createdAt,
     ]
   );
+}
 
-  // Update conversation timestamp
+async function upsertMemory(db: Db, m: PersonalMemory): Promise<void> {
   await db.runAsync(
-    'UPDATE conversations SET updated_at = ? WHERE id = ?;',
-    [Date.now(), msg.conversationId]
+    `INSERT INTO personal_memories (id, category, content, importance, source_conversation_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       category = excluded.category,
+       content = excluded.content,
+       importance = excluded.importance,
+       source_conversation_id = excluded.source_conversation_id,
+       updated_at = excluded.updated_at;`,
+    [m.id, m.category, m.content, m.importance, m.sourceConversationId ?? null, m.createdAt, m.updatedAt]
   );
 }
 
-export async function updateMessageContent(
-  id: string,
-  content: string,
-  status: 'streaming' | 'complete' | 'interrupted' | 'error' = 'complete',
-  stats?: any
-): Promise<void> {
-  const db = await getDatabase();
+async function upsertCollection(db: Db, c: DocumentCollection): Promise<void> {
   await db.runAsync(
-    `UPDATE messages SET content = ?, status = ?, tokens_per_second = ?, eval_ms = ? WHERE id = ?;`,
-    [content, status, stats?.tokensPerSecond ?? 0, stats?.evalMs ?? 0, id]
+    `INSERT INTO document_collections (id, name, description, color, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name,
+       description = excluded.description,
+       color = excluded.color;`,
+    [c.id, c.name, c.description, c.color, c.createdAt]
   );
 }
 
-export async function deleteMessage(id: string): Promise<void> {
-  const db = await getDatabase();
-  await db.runAsync('DELETE FROM messages WHERE id = ?;', [id]);
+async function writeDocument(db: Db, doc: DocumentMetadata, chunks: DocumentChunk[]): Promise<void> {
+  await db.runAsync(
+    `INSERT INTO documents (id, collection_id, name, file_type, file_size, page_count, chunk_count, indexed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       collection_id = excluded.collection_id,
+       name = excluded.name,
+       file_type = excluded.file_type,
+       file_size = excluded.file_size,
+       page_count = excluded.page_count,
+       chunk_count = excluded.chunk_count,
+       indexed_at = excluded.indexed_at;`,
+    [doc.id, doc.collectionId, doc.name, doc.fileType, doc.fileSize, doc.pageCount ?? 1, chunks.length, doc.indexedAt]
+  );
+
+  await db.runAsync('DELETE FROM document_chunks WHERE document_id = ?;', [doc.id]);
+
+  for (const ch of chunks) {
+    await db.runAsync(
+      `INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding_json, embedding_model, embedding_dim, token_count, page_number, section_header)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+      [
+        ch.id,
+        doc.id,
+        ch.chunkIndex,
+        ch.content,
+        ch.embedding ? JSON.stringify(ch.embedding) : null,
+        ch.embedding_model ?? null,
+        ch.embedding_dim ?? null,
+        ch.tokenCount,
+        ch.pageNumber ?? null,
+        ch.sectionHeader ?? null,
+      ]
+    );
+  }
 }
 
-export async function getCharacters(): Promise<CharacterCard[]> {
-  const db = await getDatabase();
-  const rows = await db.getAllAsync<any>('SELECT * FROM characters ORDER BY created_at ASC;');
-  return rows.map((r) => ({
+// ==========================================
+// Mappers
+// ==========================================
+
+function mapConversation(r: any): Conversation {
+  return {
+    id: r.id,
+    title: r.title,
+    characterId: r.character_id ?? undefined,
+    groupId: r.group_id ?? undefined,
+    engine: r.engine,
+    modelId: r.model_id,
+    systemPromptOverride: r.system_prompt_override ?? undefined,
+    summary: r.summary ?? undefined,
+    activeCollectionIds: r.active_collection_ids ? JSON.parse(r.active_collection_ids) : undefined,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function mapMessage(r: any): Message {
+  return {
+    id: r.id,
+    conversationId: r.conversation_id,
+    senderType: r.sender_type,
+    senderId: r.sender_id ?? undefined,
+    senderName: r.sender_name,
+    senderAvatar: r.sender_avatar ?? undefined,
+    content: r.content,
+    formatMode: r.format_mode,
+    citations: r.citations_json ? JSON.parse(r.citations_json) : undefined,
+    stats:
+      r.tokens_per_second || r.prompt_tokens
+        ? {
+            promptTokens: r.prompt_tokens,
+            completionTokens: r.completion_tokens,
+            totalTokens: (r.prompt_tokens ?? 0) + (r.completion_tokens ?? 0),
+            promptMs: 0,
+            evalMs: r.eval_ms,
+            tokensPerSecond: r.tokens_per_second,
+          }
+        : undefined,
+    status: r.status || 'complete',
+    createdAt: r.created_at,
+  };
+}
+
+function mapCharacter(r: any): CharacterCard {
+  return {
     id: r.id,
     name: r.name,
     tagline: r.tagline,
@@ -339,30 +434,81 @@ export async function getCharacters(): Promise<CharacterCard[]> {
     responseMode: r.response_mode,
     memoryScope: r.memory_scope,
     createdAt: r.created_at,
-  }));
+  };
+}
+
+// ==========================================
+// Conversations & messages
+// ==========================================
+
+export async function getConversations(): Promise<Conversation[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<any>('SELECT * FROM conversations ORDER BY updated_at DESC;');
+  return rows.map(mapConversation);
+}
+
+export async function getConversation(id: string): Promise<Conversation | null> {
+  const db = await getDatabase();
+  const row = await db.getFirstAsync<any>('SELECT * FROM conversations WHERE id = ?;', [id]);
+  return row ? mapConversation(row) : null;
+}
+
+export async function saveConversation(conv: Conversation): Promise<void> {
+  const db = await getDatabase();
+  await upsertConversation(db, conv);
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+  const db = await getDatabase();
+  await db.runAsync('DELETE FROM conversations WHERE id = ?;', [id]);
+}
+
+export async function getMessages(conversationId: string): Promise<Message[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<any>(
+    'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC;',
+    [conversationId]
+  );
+  return rows.map(mapMessage);
+}
+
+export async function saveMessage(msg: Message): Promise<void> {
+  const db = await getDatabase();
+  await upsertMessage(db, msg);
+  await db.runAsync('UPDATE conversations SET updated_at = ? WHERE id = ?;', [Date.now(), msg.conversationId]);
+}
+
+export async function updateMessageContent(
+  id: string,
+  content: string,
+  status: 'streaming' | 'complete' | 'interrupted' | 'error' = 'complete',
+  stats?: any
+): Promise<void> {
+  const db = await getDatabase();
+  await db.runAsync(
+    'UPDATE messages SET content = ?, status = ?, tokens_per_second = ?, eval_ms = ? WHERE id = ?;',
+    [content, status, stats?.tokensPerSecond ?? 0, stats?.evalMs ?? 0, id]
+  );
+}
+
+export async function deleteMessage(id: string): Promise<void> {
+  const db = await getDatabase();
+  await db.runAsync('DELETE FROM messages WHERE id = ?;', [id]);
+}
+
+// ==========================================
+// Personas
+// ==========================================
+
+export async function getCharacters(): Promise<CharacterCard[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<any>('SELECT * FROM characters ORDER BY created_at ASC;');
+  return rows.map(mapCharacter);
 }
 
 export async function saveCharacter(char: CharacterCard): Promise<void> {
   const db = await getDatabase();
-  await db.runAsync(
-    `INSERT OR REPLACE INTO characters (id, name, tagline, description, avatar_key, personality, system_prompt, greeting_message, example_dialogue, category, response_mode, memory_scope, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
-    [
-      char.id,
-      char.name,
-      char.tagline,
-      char.description,
-      char.avatarKey,
-      char.personality,
-      char.systemPrompt,
-      char.greetingMessage,
-      char.exampleDialogue,
-      char.category,
-      char.responseMode,
-      char.memoryScope,
-      char.createdAt,
-    ]
-  );
+  await upsertCharacter(db, char);
 }
 
 export async function deleteCharacter(id: string): Promise<void> {
@@ -370,42 +516,36 @@ export async function deleteCharacter(id: string): Promise<void> {
   await db.runAsync('DELETE FROM characters WHERE id = ?;', [id]);
 }
 
+// ==========================================
+// Group rooms
+// ==========================================
+
 export async function getGroups(): Promise<GroupChat[]> {
   const db = await getDatabase();
-  const groups = await db.getAllAsync<any>('SELECT * FROM groups ORDER BY created_at DESC;');
-  const result: GroupChat[] = [];
+  const groups = await db.getAllAsync<any>('SELECT * FROM "groups" ORDER BY created_at DESC;');
+  const memberRows = await db.getAllAsync<any>(
+    'SELECT group_id, character_id FROM group_members ORDER BY order_index ASC;'
+  );
 
-  for (const g of groups) {
-    const memberRows = await db.getAllAsync<any>(
-      'SELECT character_id FROM group_members WHERE group_id = ? ORDER BY order_index ASC;',
-      [g.id]
-    );
-    result.push({
-      id: g.id,
-      name: g.name,
-      description: g.description,
-      characterIds: memberRows.map((m) => m.character_id),
-      turnMode: g.turn_mode,
-      createdAt: g.created_at,
-    });
-  }
-
-  return result;
+  return groups.map((g) => ({
+    id: g.id,
+    name: g.name,
+    description: g.description ?? '',
+    characterIds: memberRows.filter((m) => m.group_id === g.id).map((m) => m.character_id),
+    turnMode: g.turn_mode,
+    createdAt: g.created_at,
+  }));
 }
 
 export async function saveGroup(group: GroupChat): Promise<void> {
   const db = await getDatabase();
   await db.withTransactionAsync(async () => {
-    await db.runAsync(
-      `INSERT OR REPLACE INTO groups (id, name, description, turn_mode, created_at)
-       VALUES (?, ?, ?, ?, ?);`,
-      [group.id, group.name, group.description, group.turnMode, group.createdAt]
-    );
+    await upsertGroupRow(db, group);
+    await upsertRoomConversation(db, group);
     await db.runAsync('DELETE FROM group_members WHERE group_id = ?;', [group.id]);
-
     for (let i = 0; i < group.characterIds.length; i++) {
       await db.runAsync(
-        `INSERT INTO group_members (group_id, character_id, order_index) VALUES (?, ?, ?);`,
+        'INSERT INTO group_members (group_id, character_id, order_index) VALUES (?, ?, ?);',
         [group.id, group.characterIds[i], i]
       );
     }
@@ -414,18 +554,27 @@ export async function saveGroup(group: GroupChat): Promise<void> {
 
 export async function deleteGroup(id: string): Promise<void> {
   const db = await getDatabase();
-  await db.runAsync('DELETE FROM groups WHERE id = ?;', [id]);
+  await db.withTransactionAsync(async () => {
+    await db.runAsync('DELETE FROM conversations WHERE id = ?;', [`conv-group-${id}`]);
+    await db.runAsync('DELETE FROM "groups" WHERE id = ?;', [id]);
+  });
 }
+
+// ==========================================
+// Personal memory
+// ==========================================
 
 export async function getMemories(): Promise<PersonalMemory[]> {
   const db = await getDatabase();
-  const rows = await db.getAllAsync<any>('SELECT * FROM personal_memories ORDER BY importance DESC, created_at DESC;');
+  const rows = await db.getAllAsync<any>(
+    'SELECT * FROM personal_memories ORDER BY importance DESC, created_at DESC;'
+  );
   return rows.map((r) => ({
     id: r.id,
     category: r.category,
     content: r.content,
     importance: r.importance,
-    sourceConversationId: r.source_conversation_id,
+    sourceConversationId: r.source_conversation_id ?? undefined,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }));
@@ -433,11 +582,7 @@ export async function getMemories(): Promise<PersonalMemory[]> {
 
 export async function saveMemory(m: PersonalMemory): Promise<void> {
   const db = await getDatabase();
-  await db.runAsync(
-    `INSERT OR REPLACE INTO personal_memories (id, category, content, importance, source_conversation_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?);`,
-    [m.id, m.category, m.content, m.importance, m.sourceConversationId ?? null, m.createdAt, m.updatedAt]
-  );
+  await upsertMemory(db, m);
 }
 
 export async function deleteMemory(id: string): Promise<void> {
@@ -445,13 +590,17 @@ export async function deleteMemory(id: string): Promise<void> {
   await db.runAsync('DELETE FROM personal_memories WHERE id = ?;', [id]);
 }
 
+// ==========================================
+// Knowledge base
+// ==========================================
+
 export async function getCollections(): Promise<DocumentCollection[]> {
   const db = await getDatabase();
   const rows = await db.getAllAsync<any>('SELECT * FROM document_collections ORDER BY created_at ASC;');
   return rows.map((r) => ({
     id: r.id,
     name: r.name,
-    description: r.description,
+    description: r.description ?? '',
     color: r.color,
     createdAt: r.created_at,
   }));
@@ -459,17 +608,16 @@ export async function getCollections(): Promise<DocumentCollection[]> {
 
 export async function saveCollection(c: DocumentCollection): Promise<void> {
   const db = await getDatabase();
-  await db.runAsync(
-    `INSERT OR REPLACE INTO document_collections (id, name, description, color, created_at)
-     VALUES (?, ?, ?, ?, ?);`,
-    [c.id, c.name, c.description, c.color, c.createdAt]
-  );
+  await upsertCollection(db, c);
 }
 
 export async function getDocuments(collectionId?: string): Promise<DocumentMetadata[]> {
   const db = await getDatabase();
   const rows = collectionId
-    ? await db.getAllAsync<any>('SELECT * FROM documents WHERE collection_id = ? ORDER BY indexed_at DESC;', [collectionId])
+    ? await db.getAllAsync<any>(
+        'SELECT * FROM documents WHERE collection_id = ? ORDER BY indexed_at DESC;',
+        [collectionId]
+      )
     : await db.getAllAsync<any>('SELECT * FROM documents ORDER BY indexed_at DESC;');
   return rows.map((r) => ({
     id: r.id,
@@ -486,32 +634,7 @@ export async function getDocuments(collectionId?: string): Promise<DocumentMetad
 export async function saveDocument(doc: DocumentMetadata, chunks: DocumentChunk[]): Promise<void> {
   const db = await getDatabase();
   await db.withTransactionAsync(async () => {
-    await db.runAsync(
-      `INSERT OR REPLACE INTO documents (id, collection_id, name, file_type, file_size, page_count, chunk_count, indexed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
-      [doc.id, doc.collectionId, doc.name, doc.fileType, doc.fileSize, doc.pageCount ?? 1, chunks.length, doc.indexedAt]
-    );
-
-    await db.runAsync('DELETE FROM document_chunks WHERE document_id = ?;', [doc.id]);
-
-    for (const ch of chunks) {
-      await db.runAsync(
-        `INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding_json, embedding_model, embedding_dim, token_count, page_number, section_header)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
-        [
-          ch.id,
-          ch.documentId,
-          ch.chunkIndex,
-          ch.content,
-          ch.embedding ? JSON.stringify(ch.embedding) : null,
-          ch.embedding_model ?? null,
-          ch.embedding_dim ?? null,
-          ch.tokenCount,
-          ch.pageNumber ?? null,
-          ch.sectionHeader ?? null,
-        ]
-      );
-    }
+    await writeDocument(db, doc, chunks);
   });
 }
 
@@ -525,8 +648,8 @@ export async function getAllChunks(
 ): Promise<{ chunk: DocumentChunk; docName: string }[]> {
   const db = await getDatabase();
   let sql = `
-    SELECT c.*, d.name as doc_name 
-    FROM document_chunks c 
+    SELECT c.*, d.name AS doc_name
+    FROM document_chunks c
     JOIN documents d ON c.document_id = d.id
   `;
   const params: any[] = [];
@@ -545,17 +668,20 @@ export async function getAllChunks(
       chunkIndex: r.chunk_index,
       content: r.content,
       embedding: r.embedding_json ? JSON.parse(r.embedding_json) : undefined,
-      embedding_model: r.embedding_model,
-      embedding_dim: r.embedding_dim,
+      embedding_model: r.embedding_model ?? undefined,
+      embedding_dim: r.embedding_dim ?? undefined,
       tokenCount: r.token_count,
-      pageNumber: r.page_number,
-      sectionHeader: r.section_header,
+      pageNumber: r.page_number ?? undefined,
+      sectionHeader: r.section_header ?? undefined,
     },
     docName: r.doc_name,
   }));
 }
 
-// Backup Export & Import
+// ==========================================
+// Backup export & import
+// ==========================================
+
 export async function exportDatabaseBackup(): Promise<string> {
   const [conversations, characters, groups, memories, documents, chunks, collections] =
     await Promise.all([
@@ -568,69 +694,90 @@ export async function exportDatabaseBackup(): Promise<string> {
       getCollections(),
     ]);
 
-  const backupData = {
-    schemaVersion: 2,
+  // Messages are stored per conversation, so collect them after listing conversations.
+  const messages: Message[] = [];
+  for (const conv of conversations) {
+    messages.push(...(await getMessages(conv.id)));
+  }
+
+  const backup = {
+    schemaVersion: BACKUP_SCHEMA_VERSION,
     exportedAt: Date.now(),
-    conversations,
+    collections,
     characters,
     groups,
+    conversations,
+    messages,
     memories,
     documents,
     chunks: chunks.map((c) => c.chunk),
-    collections,
   };
 
-  const jsonString = JSON.stringify(backupData, null, 2);
   const path = `${FileSystem.cacheDirectory}cloverpal_backup_${Date.now()}.json`;
-  await FileSystem.writeAsStringAsync(path, jsonString, { encoding: FileSystem.EncodingType.UTF8 });
+  await FileSystem.writeAsStringAsync(path, JSON.stringify(backup), {
+    encoding: FileSystem.EncodingType.UTF8,
+  });
 
   if (await Sharing.isAvailableAsync()) {
-    await Sharing.shareAsync(path, { mimeType: 'application/json', dialogTitle: 'Export CloverPal Backup' });
+    await Sharing.shareAsync(path, {
+      mimeType: 'application/json',
+      dialogTitle: 'Export CloverPal Backup',
+    });
   }
 
   return path;
 }
 
+/**
+ * Restores a backup in dependency order: parents before children.
+ * Each write uses its own transaction. No transaction wraps the whole import,
+ * because saveGroup/saveDocument open their own and SQLite rejects nested transactions.
+ */
 export async function importDatabaseBackup(jsonString: string): Promise<boolean> {
   try {
-    if (jsonString.length > 50 * 1024 * 1024) {
+    if (jsonString.length > MAX_BACKUP_CHARS) {
       throw new Error('Backup file exceeds 50 MB limit.');
     }
 
     const data = JSON.parse(jsonString);
-    if (!data.schemaVersion || !Array.isArray(data.characters)) {
-      throw new Error('Invalid backup schema.');
+    if (!data || typeof data.schemaVersion !== 'number' || data.schemaVersion > BACKUP_SCHEMA_VERSION) {
+      throw new Error('Unsupported backup schema.');
     }
 
+    const list = (key: string): any[] => (Array.isArray(data[key]) ? data[key] : []);
     const db = await getDatabase();
-    await db.withTransactionAsync(async () => {
-      for (const c of data.characters) {
-        await saveCharacter(c);
-      }
-      if (Array.isArray(data.groups)) {
-        for (const g of data.groups) {
-          await saveGroup(g);
-        }
-      }
-      if (Array.isArray(data.conversations)) {
-        for (const conv of data.conversations) {
-          await saveConversation(conv);
-        }
-      }
-      if (Array.isArray(data.memories)) {
-        for (const m of data.memories) {
-          await saveMemory(m);
-        }
-      }
-    });
+
+    for (const c of list('collections')) await upsertCollection(db, c);
+    for (const c of list('characters')) await upsertCharacter(db, c);
+    for (const g of list('groups')) await saveGroup(g);
+    for (const conv of list('conversations')) await upsertConversation(db, conv);
+    for (const m of list('messages')) await upsertMessage(db, m);
+    for (const m of list('memories')) await upsertMemory(db, m);
+
+    const chunksByDocument = new Map<string, DocumentChunk[]>();
+    for (const ch of list('chunks') as DocumentChunk[]) {
+      const bucket = chunksByDocument.get(ch.documentId) ?? [];
+      bucket.push(ch);
+      chunksByDocument.set(ch.documentId, bucket);
+    }
+    for (const doc of list('documents') as DocumentMetadata[]) {
+      const chunks = chunksByDocument.get(doc.id) ?? [];
+      await db.withTransactionAsync(async () => {
+        await writeDocument(db, doc, chunks);
+      });
+    }
 
     return true;
-  } catch {
+  } catch (err) {
+    console.warn('Backup import failed:', err);
     return false;
   }
 }
 
-// React Provider
+// ==========================================
+// React provider
+// ==========================================
+
 interface DatabaseContextValue {
   isReady: boolean;
   error: Error | null;
@@ -645,16 +792,10 @@ export const DatabaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   useEffect(() => {
     getDatabase()
       .then(() => setIsReady(true))
-      .catch((err) => {
-        setError(err);
-      });
+      .catch((err) => setError(err instanceof Error ? err : new Error(String(err))));
   }, []);
 
-  return React.createElement(
-    DatabaseContext.Provider,
-    { value: { isReady, error } },
-    children
-  );
+  return React.createElement(DatabaseContext.Provider, { value: { isReady, error } }, children);
 };
 
 export const useDatabase = () => useContext(DatabaseContext);
