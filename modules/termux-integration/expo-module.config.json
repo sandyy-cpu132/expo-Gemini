@@ -1,0 +1,10 @@
+{
+  "name": "termux-integration",
+  "platforms": ["android"],
+  "android": {
+    "package": "com.cloverpal.offlineai.termux",
+    "modules": [
+      "com.cloverpal.offlineai.termux.TermuxIntegrationModule"
+    ]
+  }
+}
